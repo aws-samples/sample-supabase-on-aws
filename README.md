@@ -1,5 +1,9 @@
 # Supabase-on-AWS
 
+Supabase on AWS provides a scalable and multi-tenant platform for running [Supabase](https://supabase.com) in your own AWS account. This project addresses the growing need for organizations to maintain full control over their database infrastructure, authentication, and API layer while leveraging Supabase's powerful open-source ecosystem for application development and deployment.
+
+Built based on [Supabase](https://github.com/supabase/supabase) open-source project (version [0c35ed5](https://github.com/supabase/supabase/commit/0c35ed5)). If you encounter any issues, please submit a PR directly. Special thanks to all contributors involved in the project transformation.
+
 Multi-tenant Supabase platform running on AWS, powered by ECS Fargate, Kong Gateway, Aurora PostgreSQL Serverless v2, and AWS CDK.
 
 ## Architecture
