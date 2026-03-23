@@ -1,0 +1,17 @@
+# Upstream forked repos — not our code to fix
+app/supabase/
+app/supabase-auth/
+app/supabase-postgrest/
+app/postgres-meta/
+app/function-deploy/apps/studio/
+app/function-deploy/packages/
+app/function-deploy/docker/
+app/studio/
+
+# Test scripts with intentional hardcoded test JWTs
+app/postgrest-lambda/test_*
+app/postgrest-lambda/generate_jwt.py
+tests/
+
+# Node modules
+node_modules/

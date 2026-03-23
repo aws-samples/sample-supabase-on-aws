@@ -1,0 +1,12 @@
+{
+  "slug": "api-test-function",
+  "name": "API Test Function",
+  "description": "Function deployed via API",
+  "version": "1.0.0",
+  "runtime": "deno",
+  "entrypoint": "index.ts",
+  "projectRef": "default",
+  "userId": "service_role",
+  "createdAt": "2026-02-07T07:16:21.716Z",
+  "updatedAt": "2026-02-08T09:18:23.141Z"
+}

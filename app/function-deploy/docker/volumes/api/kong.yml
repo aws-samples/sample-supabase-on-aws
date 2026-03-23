@@ -1,0 +1,341 @@
+_format_version: '2.1'
+_transform: true
+
+###
+### Consumers / Users
+###
+consumers:
+  - username: DASHBOARD
+  - username: anon
+    keyauth_credentials:
+      - key: $SUPABASE_ANON_KEY
+  - username: service_role
+    keyauth_credentials:
+      - key: $SUPABASE_SERVICE_KEY
+
+###
+### Access Control List
+###
+acls:
+  - consumer: anon
+    group: anon
+  - consumer: service_role
+    group: admin
+
+###
+### Dashboard credentials
+###
+basicauth_credentials:
+  - consumer: DASHBOARD
+    username: $DASHBOARD_USERNAME
+    password: $DASHBOARD_PASSWORD
+
+###
+### API Routes
+###
+services:
+  ## Open Auth routes
+  - name: auth-v1-open
+    url: http://auth:9999/verify
+    routes:
+      - name: auth-v1-open
+        strip_path: true
+        paths:
+          - /auth/v1/verify
+    plugins:
+      - name: cors
+  - name: auth-v1-open-callback
+    url: http://auth:9999/callback
+    routes:
+      - name: auth-v1-open-callback
+        strip_path: true
+        paths:
+          - /auth/v1/callback
+    plugins:
+      - name: cors
+  - name: auth-v1-open-authorize
+    url: http://auth:9999/authorize
+    routes:
+      - name: auth-v1-open-authorize
+        strip_path: true
+        paths:
+          - /auth/v1/authorize
+    plugins:
+      - name: cors
+
+  ## Secure Auth routes
+  - name: auth-v1
+    _comment: 'GoTrue: /auth/v1/* -> http://auth:9999/*'
+    url: http://auth:9999/
+    routes:
+      - name: auth-v1-all
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## Secure REST routes
+  - name: rest-v1
+    _comment: 'PostgREST: /rest/v1/* -> http://rest:3000/*'
+    url: http://rest:3000/
+    routes:
+      - name: rest-v1-all
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## Secure GraphQL routes
+  - name: graphql-v1
+    _comment: 'PostgREST: /graphql/v1/* -> http://rest:3000/rpc/graphql'
+    url: http://rest:3000/rpc/graphql
+    routes:
+      - name: graphql-v1-all
+        strip_path: true
+        paths:
+          - /graphql/v1
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: true
+      - name: request-transformer
+        config:
+          add:
+            headers:
+              - Content-Profile:graphql_public
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## Secure Realtime routes
+  - name: realtime-v1-ws
+    _comment: 'Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*'
+    url: http://realtime-dev.supabase-realtime:4000/socket
+    protocol: ws
+    routes:
+      - name: realtime-v1-ws
+        strip_path: true
+        paths:
+          - /realtime/v1/
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+  - name: realtime-v1-rest
+    _comment: 'Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*'
+    url: http://realtime-dev.supabase-realtime:4000/api
+    protocol: http
+    routes:
+      - name: realtime-v1-rest
+        strip_path: true
+        paths:
+          - /realtime/v1/api
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+  ## Storage routes: the storage server manages its own auth
+  - name: storage-v1
+    _comment: 'Storage: /storage/v1/* -> http://storage:5000/*'
+    url: http://storage:5000/
+    routes:
+      - name: storage-v1-all
+        strip_path: true
+        paths:
+          - /storage/v1/
+    plugins:
+      - name: cors
+
+  ## Edge Functions routes - health check (no auth required, higher priority)
+  - name: functions-v1-health
+    _comment: 'Edge Functions Health: /functions/v1/health -> http://functions:9000/health'
+    url: http://functions:9000/health
+    routes:
+      - name: functions-v1-health
+        strip_path: true
+        paths:
+          - /functions/v1/health
+        regex_priority: 100
+    plugins:
+      - name: cors
+
+  ## Edge Functions routes - all other endpoints (auth required, lower priority)
+  - name: functions-v1
+    _comment: 'Edge Functions: /functions/v1/* -> http://functions:9000/*'
+    url: http://functions:9000/
+    routes:
+      - name: functions-v1-all
+        strip_path: true
+        paths:
+          - /functions/v1/
+        regex_priority: 0
+    plugins:
+      - name: cors
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+            - anon
+
+  ## Analytics routes
+  - name: analytics-v1
+    _comment: 'Analytics: /analytics/v1/* -> http://logflare:4000/*'
+    url: http://analytics:4000/
+    routes:
+      - name: analytics-v1-all
+        strip_path: true
+        paths:
+          - /analytics/v1/
+
+  ## Secure Database routes
+  - name: meta
+    _comment: 'pg-meta: /pg/* -> http://pg-meta:8080/*'
+    url: http://meta:8080/
+    routes:
+      - name: meta-all
+        strip_path: true
+        paths:
+          - /pg/
+    plugins:
+      - name: key-auth
+        config:
+          hide_credentials: false
+      - name: acl
+        config:
+          hide_groups_header: true
+          allow:
+            - admin
+
+  ## Block access to /api/mcp
+  - name: mcp-blocker
+    _comment: 'Block direct access to /api/mcp'
+    url: http://studio:3000/api/mcp
+    routes:
+      - name: mcp-blocker-route
+        strip_path: true
+        paths:
+          - /api/mcp
+    plugins:
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
+
+  ## MCP endpoint - local access
+  - name: mcp
+    _comment: 'MCP: /mcp -> http://studio:3000/api/mcp (local access)'
+    url: http://studio:3000/api/mcp
+    routes:
+      - name: mcp
+        strip_path: true
+        paths:
+          - /mcp
+    plugins:
+      # Block access to /mcp by default
+      - name: request-termination
+        config:
+          status_code: 403
+          message: "Access is forbidden."
+      # Enable local access (danger zone!)
+      # 1. Comment out the 'request-termination' section above
+      # 2. Uncomment the entire section below, including 'deny'
+      # 3. Add your local IPs to the 'allow' list
+      #- name: cors
+      #- name: ip-restriction
+      #  config:
+      #    allow:
+      #      - 127.0.0.1
+      #      - ::1
+      #    deny: []
+
+  ## Admin API routes - require service role key
+  - name: admin-api
+    _comment: 'Admin API: /admin/v1/* -> http://tenant-manager:3001/admin/v1/*'
+    url: http://tenant-manager:3001/
+    routes:
+      - name: admin-api-all
+        strip_path: false
+        paths:
+          - /admin/v1/
+    plugins:
+      - name: cors
+      - name: request-transformer
+        config:
+          remove:
+            headers:
+              - Authorization
+              - apikey
+          add:
+            headers:
+              - apikey:$SUPABASE_SERVICE_KEY
+              - Authorization:Bearer $SUPABASE_SERVICE_KEY
+
+  ## Studio API routes - Internal APIs (no auth required, accessed by Studio frontend)
+  - name: studio-internal-api
+    _comment: 'Studio Internal API: /api/* -> http://studio:3000/api/* (for Studio frontend)'
+    url: http://studio:3000/
+    routes:
+      - name: studio-internal-api-all
+        strip_path: false
+        paths:
+          - /api/
+        regex_priority: 0
+    plugins:
+      - name: cors
+
+  ## Protected Dashboard - catch all remaining routes
+  - name: dashboard
+    _comment: 'Studio: /* -> http://studio:3000/*'
+    url: http://studio:3000/
+    routes:
+      - name: dashboard-all
+        strip_path: true
+        paths:
+          - /
+    plugins:
+      - name: cors
+      - name: basic-auth
+        config:
+          hide_credentials: true

@@ -1,0 +1,69 @@
+# Gitleaks configuration for supabase-on-aws
+# Suppresses false positives from upstream forked repos and test fixtures
+
+title = "supabase-on-aws gitleaks config"
+
+[allowlist]
+  description = "Global allowlist for upstream code, tests, and documentation"
+
+  paths = [
+    # ── Upstream Supabase monorepo (entire app/supabase/ is forked upstream code) ──
+    '''app/supabase/''',
+
+    # ── Upstream Studio fork (app/studio — legacy path in git history) ──
+    '''app/studio/''',
+
+    # ── Upstream GoTrue (supabase-auth) ──
+    '''app/supabase-auth/''',
+
+    # ── Upstream PostgREST ──
+    '''app/supabase-postgrest/''',
+
+    # ── Upstream postgres-meta ──
+    '''app/postgres-meta/''',
+
+    # ── function-deploy (Studio fork copy — upstream code) ──
+    '''app/function-deploy/''',
+
+    # ── Our test code (mock keys, fixture JWTs) ──
+    '''tests/''',
+    '''app/tenant-manager/tests/''',
+    '''app/tenant-manager/lib/.*/.*\.test\.''',
+    '''app/postgrest-lambda/test_''',
+    '''app/postgrest-lambda/generate_jwt\.py''',
+    '''app/postgrest-lambda/diagnose_''',
+
+    # ── Documentation and READMEs (placeholder examples) ──
+    '''doc/''',
+    '''docs/''',
+    '''architecture-diagrams\.md''',
+    '''TENANT_MANAGER_IMPLEMENTATION_PLAN\.md''',
+    '''DEPLOYMENT\.md''',
+    '''README\.md''',
+
+    # ── Functions service (docs and task template) ──
+    '''app/functions/README\.md''',
+    '''app/functions/functions-task-template\.json''',
+
+    # ── CDK infrastructure (secrets loaded from Secrets Manager, no real values) ──
+    '''infra/lib/supabase-stack\.ts''',
+
+    # ── Archived / deleted infrastructure files (git history only) ──
+    '''infra/archive/''',
+    '''infra/sdk-tests/''',
+    '''infra/application/infra-outputs\.json''',
+
+    # ── Node modules (should not be scanned) ──
+    '''node_modules/''',
+  ]
+
+  regexes = [
+    # Supabase default demo JWT (used in all upstream .env.example files)
+    '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZS1kZW1v''',
+    # Supabase default local dev JWT
+    '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6''',
+    # Generic placeholder secrets
+    '''your-super-secret-jwt-token''',
+    '''super-secret-jwt-token-for-tenant-manager''',
+    '''super-secret-encryption-key''',
+  ]

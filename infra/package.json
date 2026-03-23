@@ -1,0 +1,30 @@
+{
+  "name": "kong-ecs-fargate-cdk",
+  "version": "1.0.0",
+  "description": "Kong Gateway on ECS Fargate with CDK",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "deploy": "cdk deploy",
+    "synth": "cdk synth"
+  },
+  "keywords": [
+    "kong",
+    "ecs",
+    "fargate",
+    "cdk"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^20.19.35",
+    "aws-cdk": "^2.120.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.120.0",
+    "constructs": "^10.0.0"
+  }
+}

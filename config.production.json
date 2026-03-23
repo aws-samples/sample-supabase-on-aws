@@ -1,0 +1,105 @@
+{
+  "project": {
+    "name": "supabase-on-aws",
+    "environment": "production",
+    "region": "<your-aws-region>",
+    "accountId": "<your-aws-account-id>"
+  },
+  "infraStack": {
+    "vpc": {
+      "maxAzs": 3,
+      "natGateways": 2
+    },
+    "cluster": {
+      "name": "infrastack-cluster"
+    },
+    "loadBalancer": {
+      "name": "infrastack-alb"
+    },
+    "studioLoadBalancer": {
+      "name": "studio-alb"
+    },
+    "certificate": {
+      "arn": "<your-acm-certificate-arn>"
+    },
+    "ecr": {
+      "repositories": {}
+    }
+  },
+  "domain": {
+    "baseDomain": "<your-base-domain>",
+    "apiSubdomain": "api"
+  },
+  "secrets": {
+    "prefix": "postgrest/"
+  },
+  "rds": {
+    "engine": "aurora-postgresql",
+    "engineVersion": "16.6",
+    "databaseName": "supabase",
+    "port": 5432,
+    "serverlessV2MinCapacity": 1,
+    "serverlessV2MaxCapacity": 16,
+    "readers": 1
+  },
+  "workerRds": {
+    "engineVersion": "16.6",
+    "databaseName": "postgres",
+    "port": 5432,
+    "clusterIdentifier": "supabase-worker-cluster",
+    "serverlessV2MinCapacity": 1,
+    "serverlessV2MaxCapacity": 16,
+    "readers": 1
+  },
+  "redis": {
+    "nodeType": "cache.r6g.large",
+    "numCacheClusters": 2
+  },
+  "ecsTaskStack": {
+    "services": {
+      "functionsService": {
+        "cpu": 1024,
+        "memory": 2048,
+        "desiredCount": 2
+      },
+      "tenantManager": {
+        "cpu": 1024,
+        "memory": 2048,
+        "desiredCount": 2
+      },
+      "kong": {
+        "cpu": 2048,
+        "memory": 4096,
+        "desiredCount": 2
+      },
+      "postgresMeta": {
+        "cpu": 512,
+        "memory": 1024,
+        "desiredCount": 2
+      },
+      "studio": {
+        "cpu": 1024,
+        "memory": 2048,
+        "desiredCount": 2
+      },
+      "functionDeploy": {
+        "cpu": 512,
+        "memory": 1024,
+        "desiredCount": 2
+      },
+      "auth": {
+        "cpu": 512,
+        "memory": 1024,
+        "desiredCount": 2
+      }
+    }
+  },
+  "tags": {
+    "Project": "Supabase-Platform",
+    "Environment": "Production",
+    "ManagedBy": "AWS-CDK",
+    "Owner": "DevOps-Team",
+    "Version": "v1.0.0",
+    "DeploymentDate": "<deployment-date>"
+  }
+}

@@ -1,0 +1,66 @@
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# Build output
+dist/
+*.tsbuildinfo
+infra/bin/*.js
+infra/bin/*.d.ts
+infra/lib/*.js
+infra/lib/*.d.ts
+
+# Configuration (contains sensitive deployment values)
+config.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+/logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Gradle
+.gradle/
+
+# Testing
+coverage/
+.nyc_output/
+
+# Temporary files
+tmp/
+temp/
+
+# Security scan results (contains sensitive findings)
+scan-results/
+
+# Documentation (local only)
+doc/
+
+# Exclude tenant-manager and IDE/AI configs
+.cursor/
+.kiro/
+.claude/
+CLAUDE.md
+infra/cdk.context.json
+infra/cdk.out/
+infra/infra/cdk.out/
+infra/application/
+__pycache__/
+*.pyc

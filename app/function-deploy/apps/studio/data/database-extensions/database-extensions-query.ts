@@ -1,0 +1,64 @@
+import { DEFAULT_PLATFORM_APPLICATION_NAME } from '@supabase/pg-meta/src/constants'
+import { useQuery } from '@tanstack/react-query'
+import { components } from 'api-types'
+import { get, handleError } from 'data/fetchers'
+import { useSelectedProjectQuery } from 'hooks/misc/useSelectedProject'
+import { PROJECT_STATUS } from 'lib/constants'
+import type { ResponseError, UseCustomQueryOptions } from 'types'
+import { databaseExtensionsKeys } from './keys'
+
+export type DatabaseExtension = components['schemas']['PostgresExtension']
+
+export type DatabaseExtensionsVariables = {
+  projectRef?: string
+  connectionString?: string | null
+}
+
+export async function getDatabaseExtensions(
+  { projectRef, connectionString }: DatabaseExtensionsVariables,
+  signal?: AbortSignal,
+  headersInit?: HeadersInit
+) {
+  if (!projectRef) throw new Error('projectRef is required')
+
+  let headers = new Headers(headersInit)
+  if (connectionString) headers.set('x-connection-encrypted', connectionString)
+
+  const { data, error } = await get('/platform/pg-meta/{ref}/extensions', {
+    params: {
+      header: {
+        'x-connection-encrypted': connectionString!,
+        'x-pg-application-name': DEFAULT_PLATFORM_APPLICATION_NAME,
+      },
+      path: {
+        ref: projectRef,
+      },
+    },
+    headers,
+    signal,
+  })
+
+  if (error) handleError(error)
+  return data
+}
+
+export type DatabaseExtensionsData = Awaited<ReturnType<typeof getDatabaseExtensions>>
+export type DatabaseExtensionsError = ResponseError
+
+export const useDatabaseExtensionsQuery = <TData = DatabaseExtensionsData>(
+  { projectRef, connectionString }: DatabaseExtensionsVariables,
+  {
+    enabled = true,
+    ...options
+  }: UseCustomQueryOptions<DatabaseExtensionsData, DatabaseExtensionsError, TData> = {}
+) => {
+  const { data: project } = useSelectedProjectQuery()
+  const isActive = project?.status === PROJECT_STATUS.ACTIVE_HEALTHY
+
+  return useQuery<DatabaseExtensionsData, DatabaseExtensionsError, TData>({
+    queryKey: databaseExtensionsKeys.list(projectRef),
+    queryFn: ({ signal }) => getDatabaseExtensions({ projectRef, connectionString }, signal),
+    enabled: enabled && typeof projectRef !== 'undefined' && isActive,
+    ...options,
+  })
+}

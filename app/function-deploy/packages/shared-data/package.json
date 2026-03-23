@@ -1,0 +1,16 @@
+{
+  "name": "shared-data",
+  "version": "0.0.0",
+  "description": "Data shared between Supabase apps",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "scripts": {
+    "preinstall": "npx only-allow pnpm",
+    "clean": "rimraf node_modules"
+  },
+  "devDependencies": {
+    "tsconfig": "workspace:"
+  },
+  "author": "",
+  "license": "MIT"
+}

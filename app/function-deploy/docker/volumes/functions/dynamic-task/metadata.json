@@ -1,0 +1,12 @@
+{
+  "slug": "dynamic-task",
+  "name": "dynamic-task",
+  "description": "",
+  "version": "1.0.0",
+  "runtime": "deno",
+  "entrypoint": "index.ts",
+  "projectRef": "default",
+  "userId": "service_role",
+  "createdAt": "2026-02-06T16:04:13.409Z",
+  "updatedAt": "2026-02-06T16:04:13.409Z"
+}

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.git/
+.env
+.env.local
+coverage/
+tests/
+docker/
+*.md
+.gitignore
+.dockerignore

@@ -1,0 +1,4 @@
+[bandit]
+# Skip SSL verification warning in test files — tests use self-signed certs on internal ALB
+skips = B501
+exclude_dirs = app/supabase,app/function-deploy,app/supabase-auth,app/supabase-postgrest,app/postgres-meta,node_modules
