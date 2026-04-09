@@ -160,11 +160,64 @@ Add a wildcard CNAME record pointing `*.${BASE_DOMAIN}` to the Kong ALB DNS name
 
 ### 7. Create first project
 
+Use the existing CDK-deployed Worker Aurora cluster:
+
 ```bash
 ./scripts/provision-worker-and-create-project.sh
 ```
 
-### 8. Run tests
+### 8. Add more clusters and projects
+
+`create-rds-and-project.sh` creates a **new Aurora Serverless v2 cluster**, registers it with the platform, and creates a project on it -- all in one command. Every parameter is auto-detected from CloudFormation outputs, `config.json`, and Secrets Manager.
+
+```bash
+# Pass a suffix to name the cluster (supabase-worker-<suffix>)
+./scripts/create-rds-and-project.sh 02
+
+# No argument = auto-generated timestamp suffix
+./scripts/create-rds-and-project.sh
+```
+
+What the script does:
+
+| Step | Action |
+|------|--------|
+| 1 | Create Aurora Serverless v2 cluster (`supabase-worker-<suffix>`) |
+| 2 | Wait for cluster + writer instance to become available (~5-8 min) |
+| 3 | Store credentials in Secrets Manager (`supabase/worker-rds/supabase-worker-<suffix>`) |
+| 4 | Register the new instance with tenant-manager |
+| 5 | Set ECR Lambda pull permissions (idempotent) |
+| 6 | Create a project and verify it is `ACTIVE_HEALTHY` |
+
+The script is **idempotent** -- re-running with the same suffix skips already-created resources.
+
+Optional environment variable overrides:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REGION` | from `config.json` | AWS region |
+| `CLUSTER_ID` | `supabase-worker-<suffix>` | Aurora cluster identifier |
+| `WORKER_IDENTIFIER` | `worker-<suffix>` | Identifier in tenant-manager |
+| `PROJECT_NAME` | `project-<suffix>` | Project name |
+| `ENGINE_VERSION` | `16.6` | PostgreSQL version |
+| `MIN_ACU` / `MAX_ACU` | `0.5` / `4` | Serverless v2 capacity range |
+
+Full example with all parameters explicitly set:
+
+```bash
+REGION=us-west-2 \
+CLUSTER_ID=supabase-worker-prod-a \
+WORKER_IDENTIFIER=worker-prod-a \
+PROJECT_NAME=my-saas-app \
+ENGINE_VERSION=16.6 \
+MIN_ACU=1 \
+MAX_ACU=8 \
+./scripts/create-rds-and-project.sh
+```
+
+This creates a cluster `supabase-worker-prod-a` with 1-8 ACU capacity, registers it as `worker-prod-a`, and creates a project named `my-saas-app` on it.
+
+### 9. Run tests
 
 ```bash
 cd tests && pip install -r requirements.txt && ./RUN_TESTS.sh all
