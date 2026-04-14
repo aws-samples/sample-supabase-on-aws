@@ -232,9 +232,56 @@ log "Step 2: Create/reuse parameter groups..."
 
 PG_FAMILY="aurora-postgresql${ENGINE_VERSION%%.*}"
 
+# Auto-discover from existing worker cluster if not specified
+if [ "$DRY_RUN" != "1" ] && { [ -z "$CLUSTER_PG" ] || [ -z "$DB_PG" ] || [ -z "$WORKER_SG" ]; }; then
+  log "Auto-discovering PG/SG from existing worker cluster..."
+  EXISTING_WORKER=$(aws rds describe-db-clusters \
+    --region "$REGION" \
+    --query 'DBClusters[?starts_with(DBClusterIdentifier, `supabase-worker`)] | [0]' \
+    --output json 2>/dev/null) || EXISTING_WORKER="{}"
+
+  if [ "$EXISTING_WORKER" != "{}" ] && [ "$EXISTING_WORKER" != "null" ]; then
+    # Discover cluster parameter group
+    if [ -z "$CLUSTER_PG" ]; then
+      DISCOVERED_CPG=$(echo "$EXISTING_WORKER" | jq -r '.DBClusterParameterGroup // empty')
+      if [ -n "$DISCOVERED_CPG" ] && [ "$DISCOVERED_CPG" != "null" ]; then
+        CLUSTER_PG="$DISCOVERED_CPG"
+        log "  Discovered cluster PG from existing worker: $CLUSTER_PG"
+      fi
+    fi
+
+    # Discover security group
+    if [ -z "$WORKER_SG" ]; then
+      DISCOVERED_SG=$(echo "$EXISTING_WORKER" | jq -r '.VpcSecurityGroups[0].VpcSecurityGroupId // empty')
+      if [ -n "$DISCOVERED_SG" ] && [ "$DISCOVERED_SG" != "null" ]; then
+        WORKER_SG="$DISCOVERED_SG"
+        log "  Discovered SG from existing worker: $WORKER_SG"
+      fi
+    fi
+
+    # Discover DB instance parameter group from writer instance
+    if [ -z "$DB_PG" ]; then
+      EXISTING_WRITER_ID=$(echo "$EXISTING_WORKER" | jq -r '.DBClusterMembers[] | select(.IsClusterWriter==true) | .DBInstanceIdentifier // empty' 2>/dev/null | head -1)
+      if [ -n "$EXISTING_WRITER_ID" ]; then
+        DISCOVERED_DPG=$(aws rds describe-db-instances \
+          --db-instance-identifier "$EXISTING_WRITER_ID" \
+          --region "$REGION" \
+          --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' \
+          --output text 2>/dev/null) || DISCOVERED_DPG=""
+        if [ -n "$DISCOVERED_DPG" ] && [ "$DISCOVERED_DPG" != "None" ] && [ "$DISCOVERED_DPG" != "null" ]; then
+          DB_PG="$DISCOVERED_DPG"
+          log "  Discovered DB PG from existing writer: $DB_PG"
+        fi
+      fi
+    fi
+  else
+    log "  No existing worker cluster found, will create new resources"
+  fi
+fi
+
 # --- Cluster parameter group ---
 if [ -n "$CLUSTER_PG" ]; then
-  log "Reusing existing cluster parameter group: $CLUSTER_PG"
+  log "Reusing cluster parameter group: $CLUSTER_PG"
 else
   CLUSTER_PG="${CLUSTER_ID}-cluster-pg"
 
@@ -273,7 +320,7 @@ ok "Cluster PG: $CLUSTER_PG"
 
 # --- DB instance parameter group ---
 if [ -n "$DB_PG" ]; then
-  log "Reusing existing DB parameter group: $DB_PG"
+  log "Reusing DB parameter group: $DB_PG"
 else
   DB_PG="${CLUSTER_ID}-db-pg"
 
@@ -315,7 +362,7 @@ ok "DB PG: $DB_PG"
 log "Step 3: Create/reuse security group..."
 
 if [ -n "$WORKER_SG" ]; then
-  log "Reusing existing security group: $WORKER_SG"
+  log "Reusing security group: $WORKER_SG"
   WORKER_RDS_SG="$WORKER_SG"
 else
   SG_NAME="${CLUSTER_ID}-sg"
