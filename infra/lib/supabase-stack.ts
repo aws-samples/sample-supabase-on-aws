@@ -199,7 +199,7 @@ export class SupabaseStack extends cdk.Stack {
 
     const rdsCluster = new rds.DatabaseCluster(this, 'AuroraCluster', {
       engine: rds.DatabaseClusterEngine.auroraPostgres({
-        version: rds.AuroraPostgresEngineVersion.VER_16_6,
+        version: rds.AuroraPostgresEngineVersion.VER_16_8,
       }),
       serverlessV2MinCapacity: config.rds.serverlessV2MinCapacity,
       serverlessV2MaxCapacity: config.rds.serverlessV2MaxCapacity,
@@ -240,7 +240,7 @@ export class SupabaseStack extends cdk.Stack {
 
     const workerRdsCluster = new rds.DatabaseCluster(this, 'WorkerAuroraCluster', {
       engine: rds.DatabaseClusterEngine.auroraPostgres({
-        version: rds.AuroraPostgresEngineVersion.VER_16_6,
+        version: rds.AuroraPostgresEngineVersion.VER_16_8,
       }),
       serverlessV2MinCapacity: config.workerRds.serverlessV2MinCapacity,
       serverlessV2MaxCapacity: config.workerRds.serverlessV2MaxCapacity,
