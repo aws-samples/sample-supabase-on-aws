@@ -181,6 +181,20 @@ run_realtime() {
     python3 -m pytest test_realtime.py -v -s "$@"
 }
 
+run_functions() {
+    echo "=========================================="
+    echo " Running test_complete_function.py (16 tests)"
+    echo "=========================================="
+    echo " A: Setup (2)              D: Invoke (1)"
+    echo " B: Secrets (2)            E: Update + invoke (2)"
+    echo " C: Deploy (5)             F: Delete (2)"
+    echo "                           G: Cleanup (2)"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_complete_function.py -v -s "$@"
+}
+
 run_isolation() {
     echo "=========================================="
     echo " Running test_tenant_isolation.py (11 tests)"
@@ -216,6 +230,9 @@ run_all() {
     run_isolation
     echo ""
 
+    run_functions
+    echo ""
+
     echo "=========================================="
     echo " All test suites completed"
     echo "=========================================="
@@ -235,6 +252,7 @@ usage() {
     echo "  schema             test_schema_cache.py - Schema cache bug repro (7 tests, needs PROJECT_REF)"
     echo "  realtime           test_realtime.py    - Realtime: Broadcast, Presence, CDC (4 tests)"
     echo "  isolation          test_tenant_isolation.py - Cross-tenant isolation (8 tests)"
+    echo "  functions          test_complete_function.py - Edge Functions lifecycle (16 tests)"
     echo "  all                Run all test suites"
     echo ""
     echo "All configuration is auto-detected from CloudFormation + config.json."
@@ -255,7 +273,7 @@ usage() {
 SUITE="${1:-studio}"
 
 # Shift suite arg so remaining args pass to pytest
-if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation)$ ]]; then
+if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation|functions)$ ]]; then
   shift 2>/dev/null || true
 fi
 
@@ -266,6 +284,7 @@ case "$SUITE" in
     schema)    run_schema_cache "$@" ;;
     realtime)  run_realtime "$@" ;;
     isolation) run_isolation "$@" ;;
+    functions) run_functions "$@" ;;
     all)       run_all ;;
     -h|--help) usage ;;
     *)

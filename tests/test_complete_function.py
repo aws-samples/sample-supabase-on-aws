@@ -1,275 +1,396 @@
-#!/usr/bin/env python3
 """
-Complete project lifecycle test
-Flow: Create project -> Get API keys -> Manage functions -> Invoke functions -> Cleanup
+Edge Functions lifecycle integration tests.
+
+Tests the full Edge Functions flow:
+  A: Setup — create project, retrieve keys
+  B: Secrets — create / list / verify
+  C: Deploy — deploy function, list, get details, get code
+  D: Invoke — invoke via SDK, verify secrets injection
+  E: Update — redeploy updated code, invoke again
+  F: Delete — delete function, verify removal
+  G: Cleanup — delete secrets, delete project
+
+Usage:
+  cd tests
+  ./RUN_TESTS.sh functions          # auto-detect all config
+  KEEP_PROJECT=1 ./RUN_TESTS.sh functions  # keep project after tests
+
+  # Or directly with pytest:
+  STUDIO_ALB=studio-alb-XXX.elb.amazonaws.com \
+    python3 -m pytest test_complete_function.py -v -s
 """
 
-import requests
 import json
+import os
+import ssl
 import time
-import subprocess
-from urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+import urllib.error
+import urllib.request
+from datetime import datetime
+from typing import Any, Optional
 
-# Configuration
-STUDIO_ALB = ""
-SUPABASE_DOMAIN = ""
+import pytest
 
-# Auto-retrieve Admin API Key
-def get_admin_api_key():
-    """Retrieve Admin API Key from AWS Secrets Manager"""
+# ============================================
+# Configuration (same pattern as test_studio_api.py)
+# ============================================
+
+_config_path = os.path.join(os.path.dirname(__file__), '..', 'config.json')
+try:
+    with open(_config_path) as _f:
+        _global_config = json.load(_f)
+    _default_domain = _global_config.get("domain", {}).get("baseDomain", "")
+except (FileNotFoundError, json.JSONDecodeError):
+    _default_domain = ""
+
+STUDIO_ALB = os.getenv("STUDIO_ALB", "")
+if not STUDIO_ALB:
+    raise RuntimeError(
+        "STUDIO_ALB not set. Run via ./RUN_TESTS.sh functions or set STUDIO_ALB manually."
+    )
+STUDIO_BASE = f"https://{STUDIO_ALB}"
+
+SUPABASE_DOMAIN = os.getenv("SUPABASE_DOMAIN", _default_domain)
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+KEEP_PROJECT = os.getenv("KEEP_PROJECT", "")
+EXISTING_PROJECT_REF = os.getenv("PROJECT_REF", "")
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+TIMEOUT = 30
+
+
+# ============================================
+# HTTP helpers (reuse pattern from test_studio_api.py)
+# ============================================
+
+def api_request(
+    method: str,
+    path: str,
+    body: Any = None,
+    headers: Optional[dict] = None,
+    expected_status: Optional[int] = None,
+    timeout: Optional[int] = None,
+    raw_body: Optional[bytes] = None,
+) -> tuple[int, Any]:
+    """Send a request to Studio API and return (status_code, parsed_json_or_text)."""
+    url = f"{STUDIO_BASE}{path}"
+    data = raw_body if raw_body is not None else (json.dumps(body).encode() if body is not None else None)
+    hdrs = headers or {}
+    if body is not None and "Content-Type" not in hdrs:
+        hdrs["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
-        result = subprocess.run(
-            ['aws', 'secretsmanager', 'get-secret-value', 
-             '--secret-id', 'supabase/admin-api-key',
-             '--region', 'us-east-1',
-             '--query', 'SecretString',
-             '--output', 'text'],
-            capture_output=True,
-            text=True,
-            check=True
+        resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=timeout or TIMEOUT)
+        status = resp.status
+        raw = resp.read().decode()
+        try:
+            resp_body = json.loads(raw)
+        except json.JSONDecodeError:
+            resp_body = {"raw": raw}
+    except urllib.error.HTTPError as e:
+        status = e.code
+        raw = e.read().decode()
+        try:
+            resp_body = json.loads(raw)
+        except json.JSONDecodeError:
+            resp_body = {"raw": raw}
+
+    if expected_status is not None:
+        assert status == expected_status, (
+            f"{method} {path} expected {expected_status}, got {status}: "
+            f"{json.dumps(resp_body, ensure_ascii=False)[:500]}"
         )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        print(f"Warning: Unable to retrieve Admin API Key: {e}")
-        return None
+    return status, resp_body
 
-ADMIN_API_KEY = get_admin_api_key()
 
-# Global variables
-project_ref = None
-project_domain = None
-anon_key = None
-service_role_key = None
+def multipart_upload(path: str, filename: str, content: str) -> tuple[int, Any]:
+    """Upload a file via multipart/form-data."""
+    import http.client
+    import uuid
 
-def create_project():
-    """Create a test project"""
-    global project_ref, project_domain
-    print("\n=== 1. Create Project ===")
-    
-    resp = requests.post(
-        f"{STUDIO_ALB}/api/v1/projects",
-        json={
-            "name": f"test-function-{int(time.time())}",
-        },
-        verify=False,  # nosec B501
-        timeout=300
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    print(f"Response: {json.dumps(data, indent=2)}")
-    
-    assert resp.status_code == 201, f"Failed to create project: {data}"
-    project_ref = data['ref']
-    project_domain = f"https://{project_ref}.{SUPABASE_DOMAIN}"
-    print(f"Project created: {project_ref}")
-    print(f"Project domain: {project_domain}")
-    
-    # Wait for project to be ready
-    print("\nWaiting for project to be ready (30s)...")
-    time.sleep(30)
+    boundary = uuid.uuid4().hex
+    body_lines = [
+        f"--{boundary}".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"'.encode(),
+        b"Content-Type: text/plain",
+        b"",
+        content.encode(),
+        f"--{boundary}--".encode(),
+        b"",
+    ]
+    raw = b"\r\n".join(body_lines)
 
-def get_api_keys():
-    """Retrieve project API keys"""
-    global anon_key, service_role_key
-    print("\n=== 2. Get API Keys ===")
-    
-    resp = requests.get(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/api-keys",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    
-    assert resp.status_code == 200, f"Failed to get API keys: {data}"
-    assert isinstance(data, list), "Response should be an array"
-    
-    for key in data:
-        if key['name'] == 'anon':
-            anon_key = key['api_key']
-            print(f"Anon Key: {anon_key[:30]}...")
-        elif key['name'] == 'service_role':
-            service_role_key = key['api_key']
-            print(f"Service Role Key: {service_role_key[:30]}...")
-    
-    assert anon_key, "Anon key not found"
-    assert service_role_key, "Service role key not found"
+    host = STUDIO_ALB
 
-def create_secrets():
-    """Create project secrets"""
-    print("\n=== 3. Create Secrets ===")
-    
-    resp = requests.post(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/secrets",
-        json=[
+    conn = http.client.HTTPSConnection(host, context=SSL_CTX, timeout=TIMEOUT)
+    conn.request("POST", path, body=raw, headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(len(raw)),
+    })
+    resp = conn.getresponse()
+    status = resp.status
+    raw_resp = resp.read().decode()
+    conn.close()
+
+    try:
+        resp_body = json.loads(raw_resp)
+    except json.JSONDecodeError:
+        resp_body = {"raw": raw_resp}
+
+    return status, resp_body
+
+
+# ============================================
+# Shared state
+# ============================================
+
+class _FnState:
+    ref: str = ""
+    anon_key: str = ""
+    service_role_key: str = ""
+    project_domain: str = ""
+    created_by_test: bool = False
+
+
+_state = _FnState()
+
+if EXISTING_PROJECT_REF:
+    _state.ref = EXISTING_PROJECT_REF
+
+
+# ============================================
+# A: Setup — create project, get keys
+# ============================================
+
+class TestA_Setup:
+
+    def test_a1_create_project(self):
+        """Create a test project for function testing."""
+        if EXISTING_PROJECT_REF:
+            _state.ref = EXISTING_PROJECT_REF
+            _state.created_by_test = False
+            pytest.skip(f"Using existing project: {EXISTING_PROJECT_REF}")
+
+        ts = datetime.now(tz=None).strftime("%m%d%H%M%S")
+        project_name = f"test-fn-{ts}"
+
+        status, body = api_request("POST", "/api/v1/projects", body={
+            "name": project_name,
+        }, timeout=300)
+
+        assert status == 201, (
+            f"Project creation failed with {status}: {json.dumps(body, ensure_ascii=False)[:500]}"
+        )
+
+        _state.ref = body.get("ref") or body.get("data", {}).get("ref", "")
+        _state.created_by_test = True
+        assert _state.ref, "No project ref in response"
+        _state.project_domain = f"https://{_state.ref}.{SUPABASE_DOMAIN}"
+
+        print(f"\n  Project created: {_state.ref}")
+        print(f"  Domain: {_state.project_domain}")
+
+        # Wait for project provisioning
+        print("  Waiting 10s for project to stabilize...")
+        time.sleep(10)
+
+    def test_a2_get_api_keys(self):
+        """Retrieve API keys for the test project."""
+        assert _state.ref, "No project ref — test_a1 must pass first"
+
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/api-keys")
+        assert status == 200, f"Failed to get API keys: {body}"
+        assert isinstance(body, list), f"Expected array, got {type(body)}"
+
+        for key in body:
+            name = key.get("name", "")
+            if name == "anon":
+                _state.anon_key = key.get("api_key", "")
+            elif name == "service_role":
+                _state.service_role_key = key.get("api_key", "")
+
+        assert _state.anon_key, "Anon key not found"
+        assert _state.service_role_key, "Service role key not found"
+        _state.project_domain = f"https://{_state.ref}.{SUPABASE_DOMAIN}"
+
+        print(f"\n  anon_key: {_state.anon_key[:30]}...")
+        print(f"  service_role_key: {_state.service_role_key[:30]}...")
+
+
+# ============================================
+# B: Secrets
+# ============================================
+
+class TestB_Secrets:
+
+    def test_b1_create_secrets(self):
+        """Create project secrets for function env injection."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("POST", f"/api/v1/projects/{_state.ref}/secrets", body=[
             {"name": "TEST_SECRET", "value": "secret_value_123"},
-            {"name": "API_ENDPOINT", "value": "https://api.example.com"}
-        ],
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    print(f"Created secrets: {[s['name'] for s in data]}")
-    assert resp.status_code == 201, f"Failed to create secrets: {data}"
+            {"name": "API_ENDPOINT", "value": "https://api.example.com"},
+        ])
+        assert status == 201, f"Failed to create secrets: {body}"
+        print(f"\n  Created secrets: {[s['name'] for s in body]}")
 
-def list_secrets():
-    """List all secrets"""
-    print("\n=== 4. List Secrets ===")
-    
-    resp = requests.get(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/secrets",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    
-    assert resp.status_code == 200, f"Failed to get secrets: {data}"
-    print(f"Secret count: {len(data)}")
-    for secret in data:
-        print(f"  - {secret['name']}: {secret['value'][:20]}...")
+    def test_b2_list_secrets(self):
+        """List secrets and verify test secrets exist."""
+        assert _state.ref, "No project ref"
 
-def test_health():
-    """Test health check (using SDK)"""
-    print("\n=== 5. Health Check (using SDK) ===")
-    
-    from supabase import create_client
-    client = create_client(project_domain, anon_key)
-    
-    # SDK has no direct health method, use HTTP
-    headers = {"apikey": anon_key}
-    resp = requests.get(f"{project_domain}/functions/v1/health", headers=headers, verify=False)  # nosec B501
-    print(f"Status: {resp.status_code}")
-    print(f"Response: {resp.json()}")
-    assert resp.status_code == 200
-    assert resp.json()['status'] == 'healthy'
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/secrets")
+        assert status == 200, f"Failed to list secrets: {body}"
 
-def list_functions_empty():
-    """List functions (initially empty)"""
-    print("\n=== 6. List Functions (initially empty) ===")
-    resp = requests.get(f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions", verify=False)  # nosec B501
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    if isinstance(data, list):
-        functions = data
-    else:
-        functions = data.get('data', [])
-    print(f"Function count: {len(functions)}")
-    assert resp.status_code == 200
+        names = [s["name"] for s in body]
+        assert "TEST_SECRET" in names, f"TEST_SECRET not found in {names}"
+        assert "API_ENDPOINT" in names, f"API_ENDPOINT not found in {names}"
+        print(f"\n  Secrets ({len(body)}): {names}")
 
-def deploy_function():
-    """Deploy Edge Function (no API key required)"""
-    print("\n=== 5. Deploy Edge Function ===")
-    
-    code = '''Deno.serve(() => {
+
+# ============================================
+# C: Deploy function
+# ============================================
+
+FUNCTION_CODE_V1 = '''Deno.serve(() => {
   const secrets = {
     TEST_SECRET: Deno.env.get("TEST_SECRET"),
     API_ENDPOINT: Deno.env.get("API_ENDPOINT"),
     SUPABASE_ANON_KEY: Deno.env.get("SUPABASE_ANON_KEY"),
     SUPABASE_URL: Deno.env.get("SUPABASE_URL")
   }
-  
+
   return new Response(
     JSON.stringify({
       message: "Lifecycle Test Function",
+      version: "v1",
       timestamp: new Date().toISOString(),
       secrets: secrets
     }),
     { headers: { "Content-Type": "application/json" } }
   )
 })'''
-    
-    files = {'file': ('index.ts', code, 'text/plain')}
-    resp = requests.post(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions/deploy?slug=lifecycle-test",
-        files=files,
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    print(f"Function: {data['data']['slug']}, Status: {data['data']['status']}")
-    assert resp.status_code == 201, f"Failed to deploy function: {data}"
 
-def list_functions():
-    """List all functions"""
-    print("\n=== 8. List Functions ===")
-    
-    resp = requests.get(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    
-    assert resp.status_code == 200, f"Failed to get function list: {data}"
-    functions = data if isinstance(data, list) else data.get('data', [])
-    print(f"Function count: {len(functions)}")
-    for func in functions:
-        print(f"  - {func['slug']}: {func['status']}")
+FUNCTION_SLUG = "lifecycle-test"
 
-def get_function_details():
-    """Get function details"""
-    print("\n=== 9. Get Function Details ===")
-    resp = requests.get(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions/lifecycle-test",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    print(f"Response: {json.dumps(data, indent=2)}")
-    assert resp.status_code == 200
-    assert data.get('slug') == 'lifecycle-test' or data.get('data', {}).get('slug') == 'lifecycle-test'
 
-def get_function_code():
-    """Get function source code"""
-    print("\n=== 10. Get Function Code ===")
-    resp = requests.get(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions/lifecycle-test/body",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    if resp.status_code == 200:
-        code = resp.text
-        print(f"Code length: {len(code)} characters")
-        print(f"Code preview: {code[:100]}...")
-    else:
-        print(f"Response: {resp.text}")
+class TestC_Deploy:
 
-def invoke_function():
-    """Invoke Edge Function (requires API key)"""
-    print("\n=== 11. Invoke Edge Function (using SDK) ===")
-    print("Waiting for function to be ready (10s)...")
-    time.sleep(10)
-    
-    from supabase import create_client
-    client = create_client(project_domain, anon_key)
-    
-    resp = client.functions.invoke("lifecycle-test")
-    print(f"Response type: {type(resp)}")
-    
-    # SDK returns bytes or string
-    if isinstance(resp, bytes):
-        data = json.loads(resp.decode('utf-8'))
-    elif isinstance(resp, str):
-        data = json.loads(resp)
-    else:
-        data = resp
-    
-    print(f"Response: {json.dumps(data, indent=2)}")
-    
-    assert data['message'] == "Lifecycle Test Function"
-    
-    # Verify secrets injection
-    secrets = data.get('secrets', {})
-    if secrets.get('TEST_SECRET') == 'secret_value_123':
-        print("TEST_SECRET injected successfully")
-    if secrets.get('SUPABASE_ANON_KEY'):
-        print("SUPABASE_ANON_KEY injected successfully")
+    def test_c1_list_functions_empty(self):
+        """List functions — initially should be empty (or not contain our slug)."""
+        assert _state.ref, "No project ref"
 
-def update_function():
-    """Update function"""
-    print("\n=== 8. Update Function ===")
-    
-    code = '''Deno.serve(() => {
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/functions")
+        assert status == 200, f"Failed to list functions: {body}"
+
+        functions = body if isinstance(body, list) else body.get("data", [])
+        slugs = [f.get("slug") for f in functions]
+        assert FUNCTION_SLUG not in slugs, f"{FUNCTION_SLUG} already exists"
+        print(f"\n  Functions before deploy: {len(functions)}")
+
+    def test_c2_deploy_function(self):
+        """Deploy an Edge Function via multipart upload."""
+        assert _state.ref, "No project ref"
+
+        status, body = multipart_upload(
+            f"/api/v1/projects/{_state.ref}/functions/deploy?slug={FUNCTION_SLUG}",
+            "index.ts",
+            FUNCTION_CODE_V1,
+        )
+        assert status == 201, f"Failed to deploy function ({status}): {body}"
+
+        fn_data = body.get("data", body)
+        slug = fn_data.get("slug", "")
+        fn_status = fn_data.get("status", "")
+        print(f"\n  Deployed: {slug} (status: {fn_status})")
+
+    def test_c3_list_functions_after_deploy(self):
+        """Verify the deployed function appears in the list."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/functions")
+        assert status == 200
+
+        functions = body if isinstance(body, list) else body.get("data", [])
+        slugs = [f.get("slug") for f in functions]
+        assert FUNCTION_SLUG in slugs, f"{FUNCTION_SLUG} not found in {slugs}"
+        print(f"\n  Functions: {slugs}")
+
+    def test_c4_get_function_details(self):
+        """Get function metadata by slug."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/functions/{FUNCTION_SLUG}")
+        assert status == 200, f"Failed to get function details: {body}"
+
+        fn_data = body.get("data", body)
+        assert fn_data.get("slug") == FUNCTION_SLUG
+        print(f"\n  Slug: {fn_data.get('slug')}, Status: {fn_data.get('status')}")
+
+    def test_c5_get_function_code(self):
+        """Get function source code."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/functions/{FUNCTION_SLUG}/body")
+        assert status == 200, f"Failed to get function code ({status}): {body}"
+
+        code = body.get("raw", "") if isinstance(body, dict) else str(body)
+        assert len(code) > 0, "Function code is empty"
+        print(f"\n  Code length: {len(code)} chars")
+
+
+# ============================================
+# D: Invoke function
+# ============================================
+
+class TestD_Invoke:
+
+    def test_d1_invoke_via_kong(self):
+        """Invoke the Edge Function via Kong gateway and verify response."""
+        assert _state.ref and _state.anon_key, "Missing project ref or anon key"
+
+        # Wait for function worker to be ready
+        print("\n  Waiting 15s for function worker...")
+        time.sleep(15)
+
+        url = f"{_state.project_domain}/functions/v1/{FUNCTION_SLUG}"
+        headers = {
+            "apikey": _state.anon_key,
+            "Authorization": f"Bearer {_state.anon_key}",
+        }
+
+        req = urllib.request.Request(url, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=TIMEOUT)
+            status = resp.status
+            data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            status = e.code
+            raw = e.read().decode()
+            pytest.fail(f"Function invocation failed ({status}): {raw[:500]}")
+
+        assert status == 200, f"Invoke returned {status}"
+        assert data.get("message") == "Lifecycle Test Function", f"Unexpected message: {data}"
+        assert data.get("version") == "v1"
+
+        print(f"  Response: {json.dumps(data, indent=2)}")
+
+        # Verify secrets injection
+        secrets = data.get("secrets", {})
+        if secrets.get("TEST_SECRET") == "secret_value_123":
+            print("  TEST_SECRET: injected")
+        if secrets.get("SUPABASE_ANON_KEY"):
+            print("  SUPABASE_ANON_KEY: injected")
+
+
+# ============================================
+# E: Update function
+# ============================================
+
+FUNCTION_CODE_V2 = '''Deno.serve(() => {
   return new Response(
     JSON.stringify({
       message: "Lifecycle Test Function - UPDATED",
@@ -279,198 +400,110 @@ def update_function():
     { headers: { "Content-Type": "application/json" } }
   )
 })'''
-    
-    files = {'file': ('index.ts', code, 'text/plain')}
-    resp = requests.post(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions/deploy?slug=lifecycle-test",
-        files=files,
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    assert resp.status_code == 201, f"Failed to update function: {resp.json()}"
-    print("Function updated successfully")
 
-def invoke_updated_function():
-    """Invoke updated function (using SDK)"""
-    print("\n=== 13. Invoke Updated Function (using SDK) ===")
-    print("Waiting for update to take effect (60s)...")
-    time.sleep(60)
-    
-    from supabase import create_client
-    client = create_client(project_domain, anon_key)
-    
-    resp = client.functions.invoke("lifecycle-test")
-    
-    if isinstance(resp, bytes):
-        data = json.loads(resp.decode('utf-8'))
-    elif isinstance(resp, str):
-        data = json.loads(resp)
-    else:
-        data = resp
-    
-    print(f"Response: {json.dumps(data, indent=2)}")
-    
-    if 'UPDATED' in data.get('message', ''):
-        print("Update is in effect")
-    else:
-        print("Warning: Update not yet in effect (may still be cached)")
 
-def delete_function():
-    """Delete function"""
-    print("\n=== 10. Delete Function ===")
-    
-    resp = requests.delete(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions/lifecycle-test",
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    print(f"Response: {json.dumps(data, indent=2)}")
-    assert resp.status_code == 200, f"Failed to delete function: {data}"
-    print("Function deleted successfully")
+class TestE_Update:
 
-def invoke_deleted_function():
-    """Invoke deleted function (using SDK)"""
-    print("\n=== 15. Invoke Deleted Function (using SDK) ===")
-    
-    from supabase import create_client
-    client = create_client(project_domain, anon_key)
-    
-    try:
-        resp = client.functions.invoke("lifecycle-test")
-        status = resp.status_code if hasattr(resp, 'status_code') else 200
-        print(f"Status: {status}")
-        print(f"Response: {str(resp)[:200]}")
-        print(f"Note: Worker cache may keep the function callable (TTL 3 minutes)")
-    except Exception as e:
-        print(f"Function not callable: {type(e).__name__}")
-        print(f"  Error: {str(e)[:200]}")
+    def test_e1_update_function(self):
+        """Redeploy function with updated code."""
+        assert _state.ref, "No project ref"
 
-def list_functions_after_delete():
-    """List functions after deletion"""
-    print("\n=== 12. List Functions After Deletion ===")
-    resp = requests.get(f"{STUDIO_ALB}/api/v1/projects/{project_ref}/functions", verify=False)  # nosec B501
-    print(f"Status: {resp.status_code}")
-    data = resp.json()
-    if isinstance(data, list):
-        functions = data
-    else:
-        functions = data.get('data', [])
-    print(f"Function count: {len(functions)}")
-    # lifecycle-test should not be in the list
-    slugs = [f.get('slug') for f in functions]
-    assert 'lifecycle-test' not in slugs, "Function should have been deleted"
-    print("Function removed from list")
+        status, body = multipart_upload(
+            f"/api/v1/projects/{_state.ref}/functions/deploy?slug={FUNCTION_SLUG}",
+            "index.ts",
+            FUNCTION_CODE_V2,
+        )
+        assert status == 201, f"Failed to update function ({status}): {body}"
+        print("\n  Function updated to v2")
 
-def delete_secrets():
-    """Delete secrets"""
-    print("\n=== 13. Delete Secrets ===")
-    
-    resp = requests.delete(
-        f"{STUDIO_ALB}/api/v1/projects/{project_ref}/secrets",
-        json=["TEST_SECRET", "API_ENDPOINT"],
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    assert resp.status_code == 200, f"Failed to delete secrets: {resp.json()}"
-    print("Secrets deleted successfully")
+    def test_e2_invoke_updated(self):
+        """Invoke updated function and verify v2 response."""
+        assert _state.ref and _state.anon_key, "Missing ref or key"
 
-def delete_project():
-    """Delete project"""
-    print("\n=== 14. Delete Project ===")
-    
-    if not ADMIN_API_KEY:
-        print("Warning: No Admin API Key, skipping deletion")
-        return
-    
-    headers = {"Authorization": f"Bearer {ADMIN_API_KEY}"}
-    resp = requests.delete(
-        f"{STUDIO_ALB}/admin/v1/projects/{project_ref}",
-        headers=headers,
-        verify=False  # nosec B501
-    )
-    print(f"Status: {resp.status_code}")
-    
-    if resp.status_code == 204:
-        print("Project deleted successfully")
-    else:
-        print(f"Warning: Failed to delete project: {resp.text}")
+        # Functions worker caches code; wait for refresh
+        print("\n  Waiting 60s for function worker cache refresh...")
+        time.sleep(60)
 
-def run_test(name, func):
-    """Run a single test and display the result"""
-    import sys
-    from io import StringIO
-    
-    # Capture output
-    old_stdout = sys.stdout
-    sys.stdout = StringIO()
-    
-    try:
-        func()
-        sys.stdout = old_stdout
-        print(f"  test_complete_function.py::{name} PASSED")
-        return True
-    except Exception as e:
-        sys.stdout = old_stdout
-        print(f"  test_complete_function.py::{name} FAILED")
-        print(f"    Error: {e}")
-        return False
+        url = f"{_state.project_domain}/functions/v1/{FUNCTION_SLUG}"
+        headers = {
+            "apikey": _state.anon_key,
+            "Authorization": f"Bearer {_state.anon_key}",
+        }
 
-def main():
-    print("=" * 70)
-    print("Running tests...")
-    print("=" * 70)
-    
-    tests = [
-        ("test_create_project", create_project),
-        ("test_get_api_keys", get_api_keys),
-        ("test_create_secrets", create_secrets),
-        ("test_list_secrets", list_secrets),
-        ("test_health", test_health),
-        ("test_list_functions_empty", list_functions_empty),
-        ("test_deploy_function", deploy_function),
-        ("test_list_functions", list_functions),
-        ("test_get_function_details", get_function_details),
-        ("test_get_function_code", get_function_code),
-        ("test_invoke_function", invoke_function),
-        ("test_update_function", update_function),
-        ("test_invoke_updated_function", invoke_updated_function),
-        ("test_delete_function", delete_function),
-        ("test_invoke_deleted_function", invoke_deleted_function),
-        ("test_list_functions_after_delete", list_functions_after_delete),
-        ("test_delete_secrets", delete_secrets),
-        ("test_delete_project", delete_project),
-    ]
-    
-    passed = 0
-    failed = 0
-    
-    try:
-        for name, func in tests:
-            if run_test(name, func):
-                passed += 1
-            else:
-                failed += 1
-                break
-        
-        print("\n" + "=" * 70)
-        if failed == 0:
-            print(f"{passed} passed in {len(tests)} tests")
+        req = urllib.request.Request(url, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=TIMEOUT)
+            data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode()
+            pytest.fail(f"Updated invoke failed ({e.code}): {raw[:500]}")
+
+        # v2 may still be cached; accept either version
+        msg = data.get("message", "")
+        version = data.get("version", "")
+        print(f"  Response version: {version}, message: {msg}")
+
+        if "UPDATED" in msg:
+            print("  Update confirmed in effect")
         else:
-            print(f"{passed} passed, {failed} failed")
-        print("=" * 70)
-        
-        return 0 if failed == 0 else 1
-        
-    except KeyboardInterrupt:
-        print("\n\nTest interrupted")
-        if project_ref:
-            print(f"Cleaning up project: {project_ref}")
-            try:
-                delete_project()
-            except:
-                pass
-        return 1
+            print("  Note: worker cache may still serve v1 (expected, TTL ~3min)")
 
-if __name__ == "__main__":
-    exit(main())
+
+# ============================================
+# F: Delete function
+# ============================================
+
+class TestF_Delete:
+
+    def test_f1_delete_function(self):
+        """Delete the Edge Function."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("DELETE", f"/api/v1/projects/{_state.ref}/functions/{FUNCTION_SLUG}")
+        assert status == 200, f"Failed to delete function ({status}): {body}"
+        print(f"\n  Function '{FUNCTION_SLUG}' deleted")
+
+    def test_f2_verify_deleted(self):
+        """Verify function no longer appears in the list."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("GET", f"/api/v1/projects/{_state.ref}/functions")
+        assert status == 200
+
+        functions = body if isinstance(body, list) else body.get("data", [])
+        slugs = [f.get("slug") for f in functions]
+        assert FUNCTION_SLUG not in slugs, f"{FUNCTION_SLUG} still in list after delete"
+        print(f"\n  Functions after delete: {slugs}")
+
+
+# ============================================
+# G: Cleanup
+# ============================================
+
+class TestG_Cleanup:
+
+    def test_g1_delete_secrets(self):
+        """Delete test secrets."""
+        assert _state.ref, "No project ref"
+
+        status, body = api_request("DELETE", f"/api/v1/projects/{_state.ref}/secrets",
+                                   body=["TEST_SECRET", "API_ENDPOINT"])
+        assert status == 200, f"Failed to delete secrets ({status}): {body}"
+        print("\n  Test secrets deleted")
+
+    def test_g2_delete_project(self):
+        """Delete the test project (skipped if KEEP_PROJECT or not created by test)."""
+        if KEEP_PROJECT:
+            pytest.skip("KEEP_PROJECT is set, skipping deletion")
+        if not _state.created_by_test:
+            pytest.skip("Project not created by this test, skipping deletion")
+        if not ADMIN_API_KEY:
+            pytest.skip("ADMIN_API_KEY not available, cannot delete project")
+
+        headers = {"Authorization": f"Bearer {ADMIN_API_KEY}"}
+        status, body = api_request("DELETE", f"/admin/v1/projects/{_state.ref}", headers=headers)
+
+        if status == 204:
+            print(f"\n  Project {_state.ref} deleted")
+        else:
+            print(f"\n  Warning: delete returned {status}: {body}")

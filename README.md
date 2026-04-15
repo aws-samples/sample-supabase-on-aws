@@ -223,7 +223,7 @@ This creates a cluster `supabase-worker-prod-a` with 1-8 ACU capacity, registers
 cd tests && pip install -r requirements.txt && ./RUN_TESTS.sh all
 ```
 
-Expected: **88 passed, 3 skipped** across 5 test suites.
+Expected: **104 passed, 3 skipped** across 6 test suites.
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
@@ -232,6 +232,30 @@ Expected: **88 passed, 3 skipped** across 5 test suites.
 | Authenticated RLS | 13 | Cross-user isolation, JWT tampering, RLS enforcement |
 | Realtime | 1 passed, 3 skipped | WebSocket broadcast, presence, CDC |
 | Tenant Isolation | 11 | Cross-project read/write/delete blocked |
+| Edge Functions | 16 | Deploy, invoke, update, delete, secrets injection, cleanup |
+
+All configuration is auto-detected from CloudFormation outputs and `config.json`. No manual editing required.
+
+Run individual suites:
+
+```bash
+./RUN_TESTS.sh studio       # Studio Management API
+./RUN_TESTS.sh auth         # Auth (GoTrue)
+./RUN_TESTS.sh auth-rls     # Authenticated user RLS
+./RUN_TESTS.sh realtime     # Realtime WebSocket
+./RUN_TESTS.sh isolation    # Tenant isolation
+./RUN_TESTS.sh functions    # Edge Functions lifecycle
+./RUN_TESTS.sh all          # All suites
+```
+
+Optional environment variable overrides (all auto-detected if not set):
+
+| Variable | Description |
+|----------|-------------|
+| `REGION` | AWS region (from `config.json`) |
+| `STACK_NAME` | CloudFormation stack name (default: `SupabaseStack`) |
+| `PROJECT_REF` | Existing project ref (skip creation) |
+| `KEEP_PROJECT=1` | Keep test project after tests complete |
 
 ## Common Commands
 

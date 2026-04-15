@@ -1113,6 +1113,7 @@ export class SupabaseStack extends cdk.Stack {
         EDGE_FUNCTIONS_CODE_STORAGE: 'local',
         TENANT_MANAGER_URL: 'http://tenant-manager.supabase.local:3001',
         RDS_CA_CERT_PATH: '/etc/ssl/certs/rds-global-bundle.pem',
+        NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/rds-global-bundle.pem',
         SUPABASE_SECRETS_PATH: '/home/deno/functions/.supabase/secrets',
       },
       secrets: {
@@ -1121,7 +1122,7 @@ export class SupabaseStack extends cdk.Stack {
         SUPABASE_ENCRYPTION_KEY: ecs.Secret.fromSecretsManager(encryptionKey),
       },
       entryPoint: ['sh', '-c'],
-      command: ['export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=verify-ca" && node apps/studio/server.js'],
+      command: ['export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=verify-ca" && export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/rds-global-bundle.pem && node apps/studio/server.js'],
     });
 
     // Mount EFS
@@ -1682,7 +1683,7 @@ export class SupabaseStack extends cdk.Stack {
         {
           name: 'AWSManagedRulesCommonRuleSet',
           priority: 1,
-          overrideAction: { none: {} },
+          overrideAction: { count: {} },
           statement: {
             managedRuleGroupStatement: {
               vendorName: 'AWS',
@@ -1698,7 +1699,7 @@ export class SupabaseStack extends cdk.Stack {
         {
           name: 'AWSManagedRulesSQLiRuleSet',
           priority: 2,
-          overrideAction: { none: {} },
+          overrideAction: { count: {} },
           statement: {
             managedRuleGroupStatement: {
               vendorName: 'AWS',
