@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS _studio.edge_functions_metadata (
   entrypoint TEXT NOT NULL DEFAULT 'index.ts',
   user_id TEXT,
   deployment_source TEXT DEFAULT 'unknown',
-  metadata_loaded BOOLEAN DEFAULT true,
+  metadata_loaded BOOLEAN DEFAULT false,
   metadata_error TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -44,6 +44,11 @@ CREATE INDEX IF NOT EXISTS idx_edge_functions_metadata_updated_at
 
 CREATE INDEX IF NOT EXISTS idx_edge_functions_metadata_deployment_source 
   ON _studio.edge_functions_metadata(deployment_source);
+
+-- Index for filtering by metadata_loaded (used by list/exists/getMetadata queries)
+CREATE INDEX IF NOT EXISTS idx_edge_functions_metadata_loaded 
+  ON _studio.edge_functions_metadata(project_ref, metadata_loaded) 
+  WHERE metadata_loaded = true;
 
 -- Create GIN index for JSONB queries
 CREATE INDEX IF NOT EXISTS idx_edge_functions_metadata_extra_metadata 

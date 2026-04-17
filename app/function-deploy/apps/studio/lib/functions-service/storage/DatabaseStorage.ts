@@ -53,11 +53,26 @@ export class DatabaseStorage implements StorageBackend {
             entrypoint TEXT NOT NULL DEFAULT 'index.ts',
             user_id TEXT,
             deployment_source TEXT DEFAULT 'api',
+            metadata_loaded BOOLEAN NOT NULL DEFAULT false,
+            metadata_error TEXT,
             extra_metadata JSONB DEFAULT '{}'::jsonb,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             UNIQUE(project_ref, slug)
           );
+          
+          -- Add metadata_loaded column if missing (for existing tables)
+          ALTER TABLE _studio.edge_functions_metadata 
+            ADD COLUMN IF NOT EXISTS metadata_loaded BOOLEAN NOT NULL DEFAULT false;
+          ALTER TABLE _studio.edge_functions_metadata 
+            ADD COLUMN IF NOT EXISTS metadata_error TEXT;
+
+          -- Mark all pre-existing records as loaded (they were deployed before this fix)
+          UPDATE _studio.edge_functions_metadata 
+            SET metadata_loaded = true 
+            WHERE metadata_loaded = false 
+              AND metadata_error IS NULL 
+              AND created_at < NOW() - INTERVAL '1 minute';
           
           CREATE INDEX IF NOT EXISTS idx_edge_functions_project_ref 
             ON _studio.edge_functions_metadata(project_ref);
@@ -199,7 +214,7 @@ export class DatabaseStorage implements StorageBackend {
     const client = await this.getClient()
     try {
       const result = await client.query(
-        'SELECT * FROM _studio.edge_functions_metadata WHERE project_ref = $1 ORDER BY created_at DESC',
+        'SELECT * FROM _studio.edge_functions_metadata WHERE project_ref = $1 AND metadata_loaded = true ORDER BY created_at DESC',
         [projectRef]
       )
       
@@ -231,17 +246,17 @@ export class DatabaseStorage implements StorageBackend {
    * Check if a function exists
    */
   async exists(projectRef: string, functionSlug: string): Promise<boolean> {
+    const client = await this.getClient()
     try {
-      const client = await this.getClient()
       const result = await client.query(
-        'SELECT EXISTS(SELECT 1 FROM _studio.edge_functions_metadata WHERE project_ref = $1 AND slug = $2)',
+        'SELECT EXISTS(SELECT 1 FROM _studio.edge_functions_metadata WHERE project_ref = $1 AND slug = $2 AND metadata_loaded = true)',
         [projectRef, functionSlug]
       )
-      client.release()
-      
       return result.rows[0]?.exists === true
     } catch (error) {
       return false
+    } finally {
+      client.release()
     }
   }
 
@@ -250,14 +265,13 @@ export class DatabaseStorage implements StorageBackend {
    */
   async getMetadata(projectRef: string, functionSlug: string): Promise<FunctionMetadata | null> {
     await this.ensureSchema()
+    const client = await this.getClient()
     try {
-      const client = await this.getClient()
       const result = await client.query(
         `SELECT * FROM _studio.edge_functions_metadata 
-         WHERE project_ref = $1 AND slug = $2`,
+         WHERE project_ref = $1 AND slug = $2 AND metadata_loaded = true`,
         [projectRef, functionSlug]
       )
-      client.release()
 
       if (result.rows.length === 0) {
         return null
@@ -284,11 +298,19 @@ export class DatabaseStorage implements StorageBackend {
         'METADATA_ERROR',
         { projectRef, functionSlug }
       )
+    } finally {
+      client.release()
     }
   }
 
   /**
    * Store function files and metadata
+   * 
+   * Uses a two-phase approach to prevent orphan metadata records:
+   * 1. INSERT metadata with metadata_loaded = false (marks as "not ready")
+   * 2. Write files to code storage (EFS/S3)
+   * 3. UPDATE metadata_loaded = true (marks as "ready")
+   * If file write fails, the metadata record is cleaned up.
    */
   async store(
     projectRef: string,
@@ -299,11 +321,11 @@ export class DatabaseStorage implements StorageBackend {
     await this.ensureSchema()
     const client = await this.getClient()
     try {
-      // Store metadata in database
+      // Phase 1: Insert metadata with metadata_loaded = false
       await client.query(
         `INSERT INTO _studio.edge_functions_metadata 
-         (project_ref, slug, name, description, version, runtime, entrypoint, user_id, deployment_source, extra_metadata)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         (project_ref, slug, name, description, version, runtime, entrypoint, user_id, deployment_source, extra_metadata, metadata_loaded, metadata_error)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, false, NULL)
          ON CONFLICT (project_ref, slug) 
          DO UPDATE SET
            name = EXCLUDED.name,
@@ -314,6 +336,8 @@ export class DatabaseStorage implements StorageBackend {
            user_id = EXCLUDED.user_id,
            deployment_source = EXCLUDED.deployment_source,
            extra_metadata = EXCLUDED.extra_metadata,
+           metadata_loaded = false,
+           metadata_error = NULL,
            updated_at = NOW()`,
         [
           projectRef,
@@ -328,10 +352,57 @@ export class DatabaseStorage implements StorageBackend {
           JSON.stringify({}),
         ]
       )
-      
-      // Store files in code storage backend
-      const codeStorage = await this.getCodeStorage()
-      await codeStorage.store(projectRef, functionSlug, files, metadata)
+
+      // Phase 2: Write files to code storage (with retry)
+      try {
+        const codeStorage = await this.getCodeStorage()
+        let lastFileError: Error | null = null
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            await codeStorage.store(projectRef, functionSlug, files, metadata)
+            lastFileError = null
+            break
+          } catch (err) {
+            lastFileError = err instanceof Error ? err : new Error(String(err))
+            if (attempt < 2) {
+              console.warn(`[DatabaseStorage] File write attempt ${attempt} failed for '${functionSlug}', retrying in 1s...`)
+              await new Promise(resolve => setTimeout(resolve, 1000))
+            }
+          }
+        }
+
+        if (lastFileError) {
+          throw lastFileError
+        }
+      } catch (fileError) {
+        // File write failed — mark the metadata record with error and clean up
+        const errorMsg = fileError instanceof Error ? fileError.message : 'Unknown file storage error'
+        console.error(`[DatabaseStorage] File write failed for '${functionSlug}', cleaning up metadata:`, errorMsg)
+
+        try {
+          await client.query(
+            `UPDATE _studio.edge_functions_metadata 
+             SET metadata_loaded = false, metadata_error = $3, updated_at = NOW()
+             WHERE project_ref = $1 AND slug = $2`,
+            [projectRef, functionSlug, errorMsg]
+          )
+        } catch (cleanupError) {
+          console.error(`[DatabaseStorage] Failed to update metadata_error for '${functionSlug}':`, cleanupError)
+        }
+
+        throw fileError
+      }
+
+      // Phase 3: File write succeeded — mark metadata as ready
+      await client.query(
+        `UPDATE _studio.edge_functions_metadata 
+         SET metadata_loaded = true, metadata_error = NULL, updated_at = NOW()
+         WHERE project_ref = $1 AND slug = $2`,
+        [projectRef, functionSlug]
+      )
+
+      console.log(`[DatabaseStorage] Successfully stored function '${functionSlug}' (metadata + files)`)
     } catch (error) {
       throw new StorageBackendError(
         `Failed to store function: ${error instanceof Error ? error.message : 'Unknown error'}`,
