@@ -58,24 +58,34 @@ const handleGetBody = async (req: NextApiRequest, res: NextApiResponse, context:
 
       console.debug(`[API] Function ${slug} code retrieved successfully (${functionCodeResponse.files.length} files)`)
 
-      // Return multipart/form-data format as expected by the frontend
-      const boundary = `----formdata-supabase-${Date.now()}`
-      
-      res.setHeader('Content-Type', `multipart/form-data; boundary=${boundary}`)
-      
-      let multipartBody = ''
-      
-      // Add each file as a part in the multipart response
-      for (const file of functionCodeResponse.files) {
-        multipartBody += `--${boundary}\r\n`
-        multipartBody += `Content-Disposition: form-data; name="file"; filename="${file.name}"\r\n`
-        multipartBody += `Content-Type: text/plain\r\n\r\n`
-        multipartBody += `${file.content}\r\n`
+      const accept = req.headers.accept || ''
+
+      // If client requests multipart (Studio frontend), return multipart format
+      if (accept.includes('multipart/form-data')) {
+        const boundary = `----formdata-supabase-${Date.now()}`
+        res.setHeader('Content-Type', `multipart/form-data; boundary=${boundary}`)
+        
+        let multipartBody = ''
+        for (const file of functionCodeResponse.files) {
+          multipartBody += `--${boundary}\r\n`
+          multipartBody += `Content-Disposition: form-data; name="file"; filename="${file.name}"\r\n`
+          multipartBody += `Content-Type: text/plain\r\n\r\n`
+          multipartBody += `${file.content}\r\n`
+        }
+        multipartBody += `--${boundary}--\r\n`
+        return res.status(200).send(multipartBody)
       }
-      
-      multipartBody += `--${boundary}--\r\n`
-      
-      return res.status(200).send(multipartBody)
+
+      // Default: return plain content (single file) or JSON (multiple files)
+      if (functionCodeResponse.files.length === 1) {
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.setHeader('X-Function-Filename', functionCodeResponse.files[0].name)
+        return res.status(200).send(functionCodeResponse.files[0].content)
+      }
+
+      return res.status(200).json({
+        files: functionCodeResponse.files.map(f => ({ name: f.name, content: f.content }))
+      })
       
     } catch (codeError) {
       // Check if this is a lazy loading error from S3
