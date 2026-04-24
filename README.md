@@ -199,7 +199,7 @@ Optional environment variable overrides:
 | `CLUSTER_ID` | `supabase-worker-<suffix>` | Aurora cluster identifier |
 | `WORKER_IDENTIFIER` | `worker-<suffix>` | Identifier in tenant-manager |
 | `PROJECT_NAME` | `project-<suffix>` | Project name |
-| `ENGINE_VERSION` | `16.6` | PostgreSQL version |
+| `ENGINE_VERSION` | `16.8` | PostgreSQL version |
 | `MIN_ACU` / `MAX_ACU` | `0.5` / `4` | Serverless v2 capacity range |
 
 Full example with all parameters explicitly set:
@@ -209,7 +209,7 @@ REGION=us-west-2 \
 CLUSTER_ID=supabase-worker-prod-a \
 WORKER_IDENTIFIER=worker-prod-a \
 PROJECT_NAME=my-saas-app \
-ENGINE_VERSION=16.6 \
+ENGINE_VERSION=16.8 \
 MIN_ACU=1 \
 MAX_ACU=8 \
 ./scripts/create-rds-and-project.sh
