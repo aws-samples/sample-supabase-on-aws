@@ -94,6 +94,28 @@ export type ClusterMetricsRow = Selectable<ClusterMetricsTable>
 export type NewClusterMetrics = Insertable<ClusterMetricsTable>
 
 /**
+ * Edge Function metadata in _tenant schema.
+ *
+ * Phase 2 §2: per-function gateway-layer config (verify_jwt). Studio writes
+ * here; Kong pre-function reads it (via internal lookup endpoint) to decide
+ * whether the request must carry a valid apikey/JWT.
+ */
+export interface FunctionsTable {
+  project_ref: string
+  slug: string
+  name: ColumnType<string | null, string | null | undefined, string | null | undefined>
+  verify_jwt: ColumnType<boolean, boolean | undefined, boolean | undefined>
+  import_map: ColumnType<boolean, boolean | undefined, boolean | undefined>
+  lambda_arn: ColumnType<string | null, string | null | undefined, string | null | undefined>
+  inserted_at: ColumnType<Date, Date | undefined, Date | undefined>
+  updated_at: ColumnType<Date, Date | undefined, Date | undefined>
+}
+
+export type FunctionRow = Selectable<FunctionsTable>
+export type NewFunction = Insertable<FunctionsTable>
+export type FunctionUpdate = Updateable<FunctionsTable>
+
+/**
  * Database schema definition for Kysely
  * Maps to the _tenant schema in _supabase database
  */
@@ -102,4 +124,5 @@ export interface Database {
   '_tenant.db_instances': DbInstancesTable
   '_tenant.project_allocation_strategies': AllocationStrategiesTable
   '_tenant.cluster_metrics': ClusterMetricsTable
+  '_tenant.functions': FunctionsTable
 }

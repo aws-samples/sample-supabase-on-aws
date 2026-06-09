@@ -111,3 +111,35 @@ export async function deleteProjectConsumers(projectRef: string): Promise<void> 
     }
   }
 }
+
+/**
+ * Whether the canonical {projectRef}--anon consumer is currently registered.
+ * Used by the ref-reuse conflict guard to detect stale residue from a partial
+ * teardown. 404 → false, 2xx → true, other status codes propagate as errors
+ * so callers don't silently treat Kong outages as "no residue".
+ */
+export async function projectConsumerExists(projectRef: string): Promise<boolean> {
+  const username = `${projectRef}--anon`
+  const resp = await fetch(`${getKongAdminUrl()}/consumers/${username}`, { method: 'GET' })
+  if (resp.status === 404) return false
+  if (resp.ok) return true
+  const body = await resp.text().catch(() => '')
+  throw new Error(`Kong Admin GET /consumers/${username} unexpected status ${resp.status}: ${body}`)
+}
+
+/**
+ * Ensures the platform-wide anonymous-public consumer exists.
+ *
+ * Used by the /functions/v1 key-auth fallback: when a request arrives without
+ * a valid apikey, Kong attaches this consumer. The post-function plugin then
+ * decides whether the request is permitted based on the target function's
+ * verify_jwt flag (false → allow anonymous, true → 401).
+ *
+ * The consumer has NO key-auth credential (so it cannot be summoned by an
+ * apikey) but IS in ACL group 'anon' so it passes the route's acl plugin.
+ * Idempotent: safe to call on every boot.
+ */
+export async function ensureAnonymousPublicConsumer(): Promise<void> {
+  await ensureConsumer('anonymous-public')
+  await setAclGroup('anonymous-public', 'anon')
+}

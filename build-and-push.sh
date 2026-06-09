@@ -29,7 +29,7 @@ echo "========================================="
 echo ""
 
 # 所有可用服务
-ALL_SERVICES="functions kong postgrest-lambda tenant-manager postgres-meta studio function-deploy auth"
+ALL_SERVICES="functions kong postgrest-lambda tenant-manager postgres-meta studio function-deploy auth storage"
 
 # 服务配置函数: ECR仓库名|构建上下文目录|Dockerfile路径
 get_service_config() {
@@ -58,6 +58,9 @@ get_service_config() {
             ;;
         auth)
             echo "auth-service|app/supabase-auth|Dockerfile"
+            ;;
+        storage)
+            echo "storage|app/storage|Dockerfile"
             ;;
         *)
             echo ""

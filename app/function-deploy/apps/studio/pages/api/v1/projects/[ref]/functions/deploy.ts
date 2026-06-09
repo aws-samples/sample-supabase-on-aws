@@ -190,12 +190,19 @@ const handleDeploy = async (req: NextApiRequest, res: NextApiResponse, context: 
     const deploymentResult = await edgeFunctionsClient.deploy(projectRef, deploymentData)
 
     if (!deploymentResult.success) {
-      return res.status(500).json({
+      // A failed `deno check` is the user's code being wrong, not a server
+      // fault — return 422 with the real compiler errors so the user can fix
+      // it, instead of a generic 500 (二期 PDF §6).
+      const isValidationFailure =
+        (deploymentResult.details as Record<string, unknown> | undefined)?.code ===
+        'FUNCTION_VALIDATION_FAILED'
+      return res.status(isValidationFailure ? 422 : 500).json({
         data: null,
-        error: { 
+        error: {
           message: deploymentResult.error || 'Failed to deploy Edge Function',
-          details: deploymentResult.details
-        }
+          code: isValidationFailure ? 'FUNCTION_VALIDATION_FAILED' : undefined,
+          details: deploymentResult.details,
+        },
       })
     }
 

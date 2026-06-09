@@ -1119,7 +1119,8 @@ class TestE_Secrets:
         print(f"\n  Set {len(body)} secrets: {names}")
 
     def test_e2_get_secrets(self):
-        """GET secrets — should return names + digest, not raw values."""
+        """GET secrets — Phase 2 contract: plaintext values, no duplicates,
+        and the four system reserved names always present."""
         assert _state.ref, "No project ref"
 
         status, body = api_request(
@@ -1131,13 +1132,30 @@ class TestE_Secrets:
         assert status == 200, f"Get secrets failed: {status} {body}"
         assert isinstance(body, list)
 
+        names = [s["name"] for s in body]
+        assert len(names) == len(set(names)), f"Duplicate secret names returned: {names}"
+
         for secret in body:
             assert "name" in secret
-            assert "value" in secret  # This is actually a SHA256 digest
-            # Value should be a hex digest, not the raw secret
-            assert secret["value"] != "value_a", "Raw secret value should not be returned"
+            assert "value" in secret
 
-        print(f"\n  Retrieved {len(body)} secrets (digest only)")
+        # User secret values must round-trip in plaintext (matches Supabase Cloud).
+        a = next((s for s in body if s["name"] == "TEST_SECRET_A"), None)
+        if a is not None:
+            assert a["value"] == "value_a", (
+                f"TEST_SECRET_A should round-trip in plaintext, got {a['value']!r}"
+            )
+
+        # System reserved names must always be present.
+        for reserved in (
+            "SUPABASE_ANON_KEY",
+            "SUPABASE_SERVICE_ROLE_KEY",
+            "SUPABASE_URL",
+            "SUPABASE_PUBLIC_URL",
+        ):
+            assert reserved in names, f"System reserved name missing: {reserved}"
+
+        print(f"\n  Retrieved {len(body)} secrets (plaintext): {names}")
 
     def test_e3_delete_secrets(self):
         """DELETE specific secrets."""

@@ -209,6 +209,85 @@ run_isolation() {
     python3 -m pytest test_tenant_isolation.py -v -s "$@"
 }
 
+run_secrets() {
+    echo "=========================================="
+    echo " Running test_secrets_api.py (Phase 2 secrets override)"
+    echo "=========================================="
+    echo " B4: 4 system defaults present"
+    echo " B3: values returned in plaintext"
+    echo " B2: user override no duplicates"
+    echo " B1: stable across 10 sequential GETs"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_secrets_api.py -v -s "$@"
+}
+
+run_storage() {
+    echo "=========================================="
+    echo " Running test_storage.py (Phase 2 storage)"
+    echo "=========================================="
+    echo " S0: storage tenant registered after project create"
+    echo " S1: bucket create"
+    echo " S2: bucket list includes new bucket"
+    echo " S3: object upload"
+    echo " S4: object download round-trip"
+    echo " S5: signed URL"
+    echo " S6: object delete"
+    echo " S7: bucket cleanup"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_storage.py -v -s "$@"
+}
+
+run_verify_jwt() {
+    echo "=========================================="
+    echo " Running test_function_verify_jwt.py (Phase 2 verify_jwt)"
+    echo "=========================================="
+    echo " V1: internal lookup defaults verify_jwt=true"
+    echo " V2: PATCH verify_jwt persists"
+    echo " V3: verify_jwt=true rejects anonymous"
+    echo " V4: verify_jwt=false allows anonymous (Stripe/GitHub-style webhook)"
+    echo " V5: apikey still works with verify_jwt=false"
+    echo " V6: toggling back re-enforces"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_function_verify_jwt.py -v -s "$@"
+}
+
+run_fn_errors() {
+    echo "=========================================="
+    echo " Running test_function_errors.py (Phase 2 §6 error classification)"
+    echo "=========================================="
+    echo " E1: broken code rejected at deploy (422 FUNCTION_VALIDATION_FAILED)"
+    echo " E2: valid code deploys ok (201)"
+    echo " E3: missing function → 404 FUNCTION_NOT_FOUND"
+    echo " E4: valid function actually runs"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_function_errors.py -v -s "$@"
+}
+
+run_lifecycle() {
+    echo "=========================================="
+    echo " Running test_project_lifecycle.py (Phase 2 pause/resume/delete)"
+    echo "=========================================="
+    echo " K0:  create project"
+    echo " K1:  pause → status PAUSED"
+    echo " K2:  /resume alias restores → ACTIVE_HEALTHY"
+    echo " K3:  /resume == /restore (alias contract)"
+    echo " K4:  REST reachable after resume"
+    echo " K5:  delete tears down"
+    echo " K6:  same-ref recreate: clean (201) or guarded (409)"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_project_lifecycle.py -v -s "$@"
+}
+
 run_all() {
     echo "=========================================="
     echo " Running ALL test suites"
@@ -233,6 +312,18 @@ run_all() {
     run_functions
     echo ""
 
+    run_secrets
+    echo ""
+
+    run_lifecycle
+    echo ""
+
+    run_verify_jwt
+    echo ""
+
+    run_storage
+    echo ""
+
     echo "=========================================="
     echo " All test suites completed"
     echo "=========================================="
@@ -253,6 +344,10 @@ usage() {
     echo "  realtime           test_realtime.py    - Realtime: Broadcast, Presence, CDC (4 tests)"
     echo "  isolation          test_tenant_isolation.py - Cross-tenant isolation (8 tests)"
     echo "  functions          test_complete_function.py - Edge Functions lifecycle (16 tests)"
+    echo "  secrets            test_secrets_api.py     - Phase 2 secrets override semantics (8 tests)"
+    echo "  lifecycle          test_project_lifecycle.py - Phase 2 pause/resume/delete (7 tests)"
+    echo "  verify-jwt         test_function_verify_jwt.py - Phase 2 function verify_jwt (6 tests)"
+    echo "  storage            test_storage.py            - Phase 2 storage (8 tests)"
     echo "  all                Run all test suites"
     echo ""
     echo "All configuration is auto-detected from CloudFormation + config.json."
@@ -273,19 +368,24 @@ usage() {
 SUITE="${1:-studio}"
 
 # Shift suite arg so remaining args pass to pytest
-if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation|functions)$ ]]; then
+if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation|functions|secrets|lifecycle|verify-jwt|storage|fn-errors)$ ]]; then
   shift 2>/dev/null || true
 fi
 
 case "$SUITE" in
-    studio)    run_studio_api "$@" ;;
-    auth)      run_auth "$@" ;;
-    auth-rls)  run_auth_rls "$@" ;;
-    schema)    run_schema_cache "$@" ;;
-    realtime)  run_realtime "$@" ;;
-    isolation) run_isolation "$@" ;;
-    functions) run_functions "$@" ;;
-    all)       run_all ;;
+    studio)     run_studio_api "$@" ;;
+    auth)       run_auth "$@" ;;
+    auth-rls)   run_auth_rls "$@" ;;
+    schema)     run_schema_cache "$@" ;;
+    realtime)   run_realtime "$@" ;;
+    isolation)  run_isolation "$@" ;;
+    functions)  run_functions "$@" ;;
+    secrets)    run_secrets "$@" ;;
+    lifecycle)  run_lifecycle "$@" ;;
+    verify-jwt) run_verify_jwt "$@" ;;
+    fn-errors)  run_fn_errors "$@" ;;
+    storage)    run_storage "$@" ;;
+    all)        run_all ;;
     -h|--help) usage ;;
     *)
         echo "Unknown suite: $SUITE"

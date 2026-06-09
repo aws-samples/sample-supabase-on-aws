@@ -25,6 +25,8 @@ import { allocationStrategyRoutes } from './modules/balancer/allocation-strategy
 import { metricsRoutes } from './modules/metrics/metrics.routes.js'
 import { runtimeConfigRoutes } from './modules/runtime-config/runtime-config.routes.js'
 import { schemaReloadRoutes } from './modules/schema-reload/schema-reload.routes.js'
+import { functionRoutes } from './modules/functions/function.routes.js'
+import { ensureAnonymousPublicConsumer } from './integrations/kong/kong-admin.client.js'
 import { startPeriodicCollection } from './modules/metrics/metrics.service.js'
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -244,6 +246,19 @@ export async function buildApp(): Promise<FastifyInstance> {
   await fastify.register(metricsRoutes)
   await fastify.register(runtimeConfigRoutes)
   await fastify.register(schemaReloadRoutes)
+  await fastify.register(functionRoutes)
+
+  // Ensure the platform-wide anonymous-public Kong consumer exists. Required
+  // by the /functions/v1 key-auth fallback used to support verify_jwt=false.
+  try {
+    await ensureAnonymousPublicConsumer()
+    fastify.log.info('Kong anonymous-public consumer ensured')
+  } catch (error) {
+    fastify.log.warn(
+      'Failed to ensure anonymous-public Kong consumer (verify_jwt=false will not work until fixed): %s',
+      error instanceof Error ? error.message : error
+    )
+  }
 
   // Start periodic metrics collection
   startPeriodicCollection()

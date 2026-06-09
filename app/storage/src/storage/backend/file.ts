@@ -1,0 +1,705 @@
+import type { Stats } from 'node:fs'
+import fs from 'node:fs'
+import * as fsp from 'node:fs/promises'
+import { ERRORS, StorageBackendError } from '@internal/errors'
+import { ensureDir, ensureFile, pathExists, removePath } from '@internal/fs'
+import { createHash, randomUUID } from 'crypto'
+import * as xattr from 'fs-xattr'
+import path from 'path'
+import stream from 'stream'
+import { promisify } from 'util'
+import { getConfig } from '../../config'
+import {
+  BrowserCacheHeaders,
+  ObjectMetadata,
+  ObjectResponse,
+  StorageBackendAdapter,
+  UploadPart,
+  withOptionalVersion,
+} from './adapter'
+
+const pipeline = promisify(stream.pipeline)
+
+interface FileMetadata {
+  cacheControl: string
+  contentType: string
+}
+
+// file metadata attribute keys on different platforms
+const METADATA_ATTR_KEYS = {
+  darwin: {
+    'cache-control': 'com.apple.metadata.supabase.cache-control',
+    'content-type': 'com.apple.metadata.supabase.content-type',
+    etag: 'com.apple.metadata.supabase.etag',
+  },
+  linux: {
+    'cache-control': 'user.supabase.cache-control',
+    'content-type': 'user.supabase.content-type',
+    etag: 'user.supabase.etag',
+  },
+}
+
+/**
+ * FileBackend
+ * Interacts with the file system with this FileBackend adapter
+ */
+export class FileBackend implements StorageBackendAdapter {
+  client = null
+  filePath: string
+  etagAlgorithm: 'mtime' | 'md5'
+
+  constructor() {
+    const { storageFilePath, storageFileEtagAlgorithm } = getConfig()
+    if (!storageFilePath) {
+      throw new Error('FILE_STORAGE_BACKEND_PATH env variable not set')
+    }
+    this.filePath = path.isAbsolute(storageFilePath)
+      ? storageFilePath
+      : path.resolve(__dirname, '..', '..', '..', storageFilePath)
+    this.etagAlgorithm = storageFileEtagAlgorithm
+  }
+
+  async list(
+    bucket: string,
+    options?: {
+      prefix?: string
+      delimiter?: string
+      nextToken?: string
+      startAfter?: string
+    }
+  ): Promise<{ keys: { name: string; size: number }[]; nextToken?: string }> {
+    return Promise.resolve({ keys: [] })
+  }
+
+  /**
+   * Gets an object body and metadata
+   * @param bucketName
+   * @param key
+   * @param version
+   * @param headers
+   */
+  async getObject(
+    bucketName: string,
+    key: string,
+    version: string | undefined,
+    headers?: BrowserCacheHeaders
+  ): Promise<ObjectResponse> {
+    // 'Range: bytes=#######-######
+    const file = this.resolveSecurePath(withOptionalVersion(`${bucketName}/${key}`, version))
+    const data = await fsp.stat(file)
+    const eTag = await this.etag(file, data)
+    const fileSize = data.size
+    const { cacheControl, contentType } = await this.getFileMetadata(file)
+    const lastModified = data.mtime
+
+    if (headers?.ifNoneMatch && headers.ifNoneMatch === eTag) {
+      return {
+        metadata: {
+          cacheControl: cacheControl || 'no-cache',
+          mimetype: contentType || 'application/octet-stream',
+          lastModified,
+          httpStatusCode: 304,
+          size: data.size,
+          eTag,
+          contentLength: 0,
+        },
+        body: undefined,
+        httpStatusCode: 304,
+      }
+    }
+
+    if (headers?.ifModifiedSince) {
+      const ifModifiedSince = new Date(headers.ifModifiedSince)
+      if (lastModified <= ifModifiedSince) {
+        return {
+          metadata: {
+            cacheControl: cacheControl || 'no-cache',
+            mimetype: contentType || 'application/octet-stream',
+            lastModified,
+            httpStatusCode: 304,
+            size: data.size,
+            eTag,
+            contentLength: 0,
+          },
+          body: undefined,
+          httpStatusCode: 304,
+        }
+      }
+    }
+
+    if (headers?.range) {
+      const parts = headers.range.replace(/bytes=/, '').split('-')
+      const startRange = parseInt(parts[0], 10)
+      const endRange = parts[1] ? parseInt(parts[1], 10) : fileSize - 1
+      const size = endRange - startRange
+      const chunkSize = size + 1
+      const body = fs.createReadStream(file, { start: startRange, end: endRange })
+
+      return {
+        metadata: {
+          cacheControl: cacheControl || 'no-cache',
+          mimetype: contentType || 'application/octet-stream',
+          lastModified,
+          contentRange: `bytes ${startRange}-${endRange}/${fileSize}`,
+          httpStatusCode: 206,
+          size,
+          eTag,
+          contentLength: chunkSize,
+        },
+        httpStatusCode: 206,
+        body,
+      }
+    } else {
+      const body = fs.createReadStream(file)
+      return {
+        metadata: {
+          cacheControl: cacheControl || 'no-cache',
+          mimetype: contentType || 'application/octet-stream',
+          lastModified,
+          httpStatusCode: 200,
+          size: data.size,
+          eTag,
+          contentLength: fileSize,
+        },
+        body,
+        httpStatusCode: 200,
+      }
+    }
+  }
+
+  /**
+   * Uploads and store an object
+   * @param bucketName
+   * @param key
+   * @param version
+   * @param body
+   * @param contentType
+   * @param cacheControl
+   */
+  async uploadObject(
+    bucketName: string,
+    key: string,
+    version: string | undefined,
+    body: NodeJS.ReadableStream,
+    contentType: string,
+    cacheControl: string,
+    signal?: AbortSignal,
+    contentLength?: number
+  ): Promise<ObjectMetadata> {
+    try {
+      const file = this.resolveSecurePath(withOptionalVersion(`${bucketName}/${key}`, version))
+      await ensureFile(file)
+      const destFile = fs.createWriteStream(file)
+      await pipeline(body, destFile)
+
+      await this.setFileMetadata(file, {
+        contentType: contentType || 'application/octet-stream',
+        cacheControl: cacheControl || 'no-cache',
+      })
+
+      const metadata = await this.headObject(bucketName, key, version)
+
+      return {
+        ...metadata,
+        httpStatusCode: 200,
+      }
+    } catch (err: any) {
+      if (err instanceof StorageBackendError) {
+        throw err
+      }
+      throw StorageBackendError.fromError(err)
+    }
+  }
+
+  /**
+   * Deletes an object from the file system
+   * @param bucket
+   * @param key
+   * @param version
+   */
+  async deleteObject(bucket: string, key: string, version: string | undefined): Promise<void> {
+    try {
+      const file = this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
+      await removePath(file)
+
+      // Clean up empty parent directories
+      await this.cleanupEmptyDirectories(path.dirname(file))
+    } catch (e) {
+      if (e instanceof Error && 'code' in e) {
+        if ((e as any).code === 'ENOENT') {
+          return
+        }
+        throw e
+      }
+    }
+  }
+
+  /**
+   * Copies an existing object to the given location
+   * @param bucket
+   * @param source
+   * @param version
+   * @param destination
+   * @param destinationVersion
+   * @param metadata
+   */
+  async copyObject(
+    bucket: string,
+    source: string,
+    version: string | undefined,
+    destination: string,
+    destinationVersion: string,
+    metadata: { cacheControl?: string; contentType?: string }
+  ): Promise<Pick<ObjectMetadata, 'httpStatusCode' | 'eTag' | 'lastModified'>> {
+    const srcFile = this.resolveSecurePath(withOptionalVersion(`${bucket}/${source}`, version))
+    const destFile = this.resolveSecurePath(
+      withOptionalVersion(`${bucket}/${destination}`, destinationVersion)
+    )
+
+    await ensureFile(destFile)
+    await fsp.copyFile(srcFile, destFile)
+
+    const originalMetadata = await this.getFileMetadata(srcFile)
+    await this.setFileMetadata(destFile, Object.assign({}, originalMetadata, metadata))
+
+    const fileStat = await fsp.lstat(destFile)
+    const eTag = await this.etag(destFile, fileStat)
+
+    return {
+      httpStatusCode: 200,
+      lastModified: fileStat.mtime,
+      eTag,
+    }
+  }
+
+  /**
+   * Deletes multiple objects
+   * @param bucket
+   * @param prefixes
+   */
+  async deleteObjects(bucket: string, prefixes: string[]): Promise<void> {
+    const promises = prefixes.map((prefix) => {
+      return removePath(this.resolveSecurePath(`${bucket}/${prefix}`))
+    })
+    const results = await Promise.allSettled(promises)
+
+    // Collect unique parent directories for cleanup
+    const parentDirs = new Set<string>()
+
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        throw result.reason
+      } else {
+        // Add parent directory of successfully deleted file
+        const filePath = this.resolveSecurePath(`${bucket}/${prefixes[index]}`)
+        parentDirs.add(path.dirname(filePath))
+      }
+    })
+
+    // Clean up empty directories
+    for (const dir of parentDirs) {
+      try {
+        await this.cleanupEmptyDirectories(dir)
+      } catch {
+        // Ignore cleanup errors to not affect the main deletion operation
+      }
+    }
+  }
+
+  /**
+   * Returns metadata information of a specific object
+   * @param bucket
+   * @param key
+   * @param version
+   */
+  async headObject(
+    bucket: string,
+    key: string,
+    version: string | undefined
+  ): Promise<ObjectMetadata> {
+    const file = this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
+
+    const data = await fsp.stat(file)
+    const { cacheControl, contentType } = await this.getFileMetadata(file)
+    const lastModified = data.mtime
+    const eTag = await this.etag(file, data)
+
+    return {
+      httpStatusCode: 200,
+      size: data.size,
+      cacheControl: cacheControl || 'no-cache',
+      mimetype: contentType || 'application/octet-stream',
+      eTag,
+      lastModified,
+      contentLength: data.size,
+    }
+  }
+
+  async createMultiPartUpload(
+    bucketName: string,
+    key: string,
+    version: string | undefined,
+    contentType: string,
+    cacheControl: string
+  ): Promise<string | undefined> {
+    const uploadId = randomUUID()
+    const multiPartFolder = this.resolveSecurePath(
+      path.join('multiparts', uploadId, bucketName, withOptionalVersion(key, version))
+    )
+    const multipartFile = this.resolveSecurePath(
+      path.join(
+        'multiparts',
+        uploadId,
+        bucketName,
+        withOptionalVersion(key, version),
+        'metadata.json'
+      )
+    )
+    await ensureDir(multiPartFolder)
+    await fsp.writeFile(multipartFile, JSON.stringify({ contentType, cacheControl }))
+
+    return uploadId
+  }
+
+  async uploadPart(
+    bucketName: string,
+    key: string,
+    version: string,
+    uploadId: string,
+    partNumber: number,
+    body: stream.Readable
+  ): Promise<{ ETag?: string }> {
+    const partPath = this.resolveSecurePath(
+      path.join(
+        'multiparts',
+        uploadId,
+        bucketName,
+        withOptionalVersion(key, version),
+        `part-${partNumber}`
+      )
+    )
+
+    const writeStream = fs.createWriteStream(partPath)
+
+    await pipeline(body, writeStream)
+
+    const etag = await this.computeMd5(partPath)
+
+    const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
+    await this.setMetadataAttr(partPath, METADATA_ATTR_KEYS[platform]['etag'], etag)
+
+    return { ETag: etag }
+  }
+
+  async completeMultipartUpload(
+    bucketName: string,
+    key: string,
+    uploadId: string,
+    version: string,
+    parts: UploadPart[]
+  ): Promise<
+    Omit<UploadPart, 'PartNumber'> & {
+      location?: string
+      bucket?: string
+      version: string
+    }
+  > {
+    const partsByEtags = parts.map(async (part) => {
+      const partFilePath = this.resolveSecurePath(
+        path.join(
+          'multiparts',
+          uploadId,
+          bucketName,
+          withOptionalVersion(key, version),
+          `part-${part.PartNumber}`
+        )
+      )
+      const partExists = await pathExists(partFilePath)
+
+      if (partExists) {
+        const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
+        const etag = await this.getMetadataAttr(partFilePath, METADATA_ATTR_KEYS[platform]['etag'])
+        if (etag === part.ETag) {
+          return partFilePath
+        }
+        throw ERRORS.InvalidChecksum(`Invalid ETag for part ${part.PartNumber}`)
+      }
+
+      throw ERRORS.MissingPart(part.PartNumber || 0, uploadId)
+    })
+
+    const finalParts = await Promise.all(partsByEtags)
+    finalParts.sort((a, b) => parseInt(a.split('-')[1]) - parseInt(b.split('-')[1]))
+
+    const multipartStream = this.mergePartStreams(finalParts)
+    const metadataContent = await fsp.readFile(
+      this.resolveSecurePath(
+        path.join(
+          'multiparts',
+          uploadId,
+          bucketName,
+          withOptionalVersion(key, version),
+          'metadata.json'
+        )
+      ),
+      'utf-8'
+    )
+
+    const metadata = JSON.parse(metadataContent)
+
+    const uploaded = await this.uploadObject(
+      bucketName,
+      key,
+      version,
+      multipartStream,
+      metadata.contentType,
+      metadata.cacheControl
+    )
+
+    removePath(this.resolveSecurePath(path.join('multiparts', uploadId))).catch(() => {
+      // no-op
+    })
+
+    return {
+      version,
+      ETag: uploaded.eTag,
+      bucket: bucketName,
+      location: `${bucketName}/${key}`,
+    }
+  }
+
+  async abortMultipartUpload(
+    bucketName: string,
+    key: string,
+    uploadId: string,
+    version?: string
+  ): Promise<void> {
+    const multiPartFolder = this.resolveSecurePath(path.join('multiparts', uploadId))
+
+    await removePath(multiPartFolder)
+
+    // Clean up empty parent directories
+    try {
+      await this.cleanupEmptyDirectories(path.dirname(multiPartFolder))
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  async uploadPartCopy(
+    storageS3Bucket: string,
+    key: string,
+    version: string,
+    UploadId: string,
+    PartNumber: number,
+    sourceKey: string,
+    sourceVersion?: string,
+    rangeBytes?: { fromByte: number; toByte: number }
+  ): Promise<{ eTag?: string; lastModified?: Date }> {
+    const partFilePath = this.resolveSecurePath(
+      path.join(
+        'multiparts',
+        UploadId,
+        storageS3Bucket,
+        withOptionalVersion(key, version),
+        `part-${PartNumber}`
+      )
+    )
+    const sourceFilePath = this.resolveSecurePath(
+      `${storageS3Bucket}/${withOptionalVersion(sourceKey, sourceVersion)}`
+    )
+
+    const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
+
+    const readStreamOptions = rangeBytes
+      ? { start: rangeBytes.fromByte, end: rangeBytes.toByte }
+      : {}
+    const partStream = fs.createReadStream(sourceFilePath, readStreamOptions)
+
+    const writePart = fs.createWriteStream(partFilePath)
+    await pipeline(partStream, writePart)
+
+    const etag = await this.computeMd5(partFilePath)
+    await this.setMetadataAttr(partFilePath, METADATA_ATTR_KEYS[platform]['etag'], etag)
+
+    const fileStat = await fsp.lstat(partFilePath)
+
+    return {
+      eTag: etag,
+      lastModified: fileStat.mtime,
+    }
+  }
+
+  private mergePartStreams(partPaths: string[]): stream.Readable {
+    return stream.Readable.from(this.iteratePartChunks(partPaths))
+  }
+
+  private async *iteratePartChunks(partPaths: string[]): AsyncGenerator<Buffer> {
+    for (const partPath of partPaths) {
+      const partStream = fs.createReadStream(partPath)
+      for await (const chunk of partStream) {
+        yield chunk as Buffer
+      }
+    }
+  }
+
+  private async computeMd5(filePath: string): Promise<string> {
+    const hash = createHash('md5')
+    const readStream = fs.createReadStream(filePath)
+
+    for await (const chunk of readStream) {
+      hash.update(chunk)
+    }
+
+    return hash.digest('hex')
+  }
+
+  /**
+   * Returns a private url that can only be accessed internally by the system
+   * @param bucket
+   * @param key
+   * @param version
+   */
+  async privateAssetUrl(bucket: string, key: string, version: string | undefined): Promise<string> {
+    return 'local:///' + this.resolveSecurePath(withOptionalVersion(`${bucket}/${key}`, version))
+  }
+
+  async setFileMetadata(file: string, { contentType, cacheControl }: FileMetadata) {
+    const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
+    await Promise.all([
+      this.setMetadataAttr(file, METADATA_ATTR_KEYS[platform]['cache-control'], cacheControl),
+      this.setMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-type'], contentType),
+    ])
+  }
+
+  close() {
+    // no-op
+  }
+
+  protected async getFileMetadata(file: string) {
+    const platform = process.platform === 'darwin' ? 'darwin' : 'linux'
+    const [cacheControl, contentType] = await Promise.all([
+      this.getMetadataAttr(file, METADATA_ATTR_KEYS[platform]['cache-control']),
+      this.getMetadataAttr(file, METADATA_ATTR_KEYS[platform]['content-type']),
+    ])
+
+    return {
+      cacheControl,
+      contentType,
+    } as FileMetadata
+  }
+
+  protected getMetadataAttr(file: string, attribute: string): Promise<string | undefined> {
+    return xattr.get(file, attribute).then((value) => {
+      return value?.toString() ?? undefined
+    })
+  }
+
+  protected setMetadataAttr(file: string, attribute: string, value: string): Promise<void> {
+    return xattr.set(file, attribute, value)
+  }
+
+  /**
+   * Efficiently checks if a directory is empty by reading only the first entry
+   * @param dirPath The directory path to check
+   * @returns Promise<boolean> true if directory is empty, false otherwise
+   */
+  protected async isEmptyDirectory(dirPath: string): Promise<boolean> {
+    try {
+      const directory = await fsp.opendir(dirPath)
+      const entry = await directory.read()
+      await directory.close()
+
+      return entry === null
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Recursively removes empty directories up to the storage root
+   * @param dirPath The directory path to start cleanup from
+   */
+  protected async cleanupEmptyDirectories(dirPath: string): Promise<void> {
+    try {
+      // Don't cleanup beyond the storage root path
+      if (!dirPath.startsWith(this.filePath) || dirPath === this.filePath) {
+        return
+      }
+
+      // Check if directory exists
+      const exists = await pathExists(dirPath)
+      if (!exists) {
+        return
+      }
+
+      // Check if directory is empty - using opendir for better performance with large directories
+      const isEmpty = await this.isEmptyDirectory(dirPath)
+      if (isEmpty) {
+        // Remove empty directory - using fs.remove for better cross-platform compatibility
+        await removePath(dirPath)
+
+        // Recursively check parent directory
+        const parentDir = path.dirname(dirPath)
+        await this.cleanupEmptyDirectories(parentDir)
+      }
+    } catch {
+      // Ignore errors during cleanup to not affect main operations
+      // Could be permission issues, concurrent access, directory not empty due to race conditions, etc.
+      // Optional: Log for debugging purposes (uncomment if needed)
+      // console.debug('Directory cleanup failed:', dirPath, e.message)
+    }
+  }
+
+  /**
+   * Securely resolves a path within the storage directory, preventing path traversal attacks
+   * @param relativePath The relative path to resolve
+   * @throws {StorageBackendError} If the resolved path escapes the storage directory
+   */
+  private resolveSecurePath(relativePath: string): string {
+    if (relativePath.includes('\0')) {
+      throw ERRORS.InvalidKey(`Invalid key: ${relativePath} contains null byte`)
+    }
+
+    if (path.isAbsolute(relativePath)) {
+      throw ERRORS.InvalidKey(`Invalid key: ${relativePath} must be a relative path`)
+    }
+
+    const isWindowsDriveAbsolutePath = /^[a-zA-Z]:[\\/]/.test(relativePath)
+    const isWindowsUncPath = /^\\\\[^\\/]+[\\/][^\\/]+/.test(relativePath)
+    if (isWindowsDriveAbsolutePath || isWindowsUncPath) {
+      throw ERRORS.InvalidKey(`Invalid key: ${relativePath} must not be an absolute Windows path`)
+    }
+
+    const hasDotTraversalSegment = relativePath
+      .split(/[\\/]+/)
+      .filter(Boolean)
+      .some((segment) => segment === '.' || segment === '..')
+
+    if (hasDotTraversalSegment) {
+      throw ERRORS.InvalidKey(`Path traversal detected: ${relativePath} contains dot path segment`)
+    }
+
+    const resolvedPath = path.resolve(this.filePath, relativePath)
+    const normalizedPath = path.normalize(resolvedPath)
+
+    // Ensure the resolved path is within the storage directory
+    if (!normalizedPath.startsWith(this.filePath + path.sep) && normalizedPath !== this.filePath) {
+      throw ERRORS.InvalidKey(
+        `Path traversal detected: ${relativePath} resolves outside storage directory`
+      )
+    }
+
+    return normalizedPath
+  }
+
+  private async etag(file: string, stats: Stats): Promise<string> {
+    if (this.etagAlgorithm === 'md5') {
+      const checksum = await this.computeMd5(file)
+      return `"${checksum}"`
+    } else if (this.etagAlgorithm === 'mtime') {
+      return `"${stats.mtimeMs.toString(16)}-${stats.size.toString(16)}"`
+    }
+    throw new Error('FILE_STORAGE_ETAG_ALGORITHM env variable must be either "mtime" or "md5"')
+  }
+}

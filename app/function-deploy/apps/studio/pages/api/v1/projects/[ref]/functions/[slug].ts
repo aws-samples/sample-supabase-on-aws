@@ -5,6 +5,36 @@ import { FunctionFile, StorageNotFoundError } from 'lib/functions-service/storag
 import { withCORS } from 'lib/functions-service/cors/CORSMiddleware'
 import { getFunctionMetadataService } from 'lib/functions-service/metadata/FunctionMetadataService'
 import { getFunctionErrorHandler } from 'lib/functions-service/errors/FunctionErrorHandler'
+import { tenantManagerFetch } from 'lib/api/tenant-manager'
+
+interface FunctionMetadataRow {
+  project_ref: string
+  slug: string
+  verify_jwt: boolean
+  import_map?: boolean
+  name?: string | null
+}
+
+async function fetchVerifyJwt(projectRef: string, slug: string): Promise<boolean> {
+  // Default to true (secure default) if tenant-manager has nothing for this
+  // function — matches the internal lookup endpoint contract used by Kong.
+  try {
+    const resp = await tenantManagerFetch<FunctionMetadataRow>(
+      `/admin/v1/projects/${projectRef}/functions/${slug}`,
+    )
+    if (resp.error) {
+      console.warn(`[functions-meta] tenant-manager returned error for ${projectRef}/${slug}: ${resp.error.message}`)
+      return true
+    }
+    if (resp.data && typeof resp.data.verify_jwt === 'boolean') {
+      return resp.data.verify_jwt
+    }
+    return true
+  } catch (error) {
+    console.warn(`[functions-meta] tenant-manager unreachable, defaulting to verify_jwt=true:`, error)
+    return true
+  }
+}
 
 // Helper function to increment version
 function incrementVersion(currentVersion: string): string {
@@ -34,14 +64,60 @@ async function handler(req: NextApiRequest, res: NextApiResponse, context: Proje
       return handleGet(req, res, context)
     case 'PUT':
       return handleUpdate(req, res, context)
+    case 'PATCH':
+      return handlePatch(req, res, context)
     case 'DELETE':
       return handleDelete(req, res, context)
     default:
-      res.setHeader('Allow', ['GET', 'PUT', 'DELETE'])
-      res.status(405).json({ 
-        error: { message: `Method ${method} Not Allowed` } 
+      res.setHeader('Allow', ['GET', 'PUT', 'PATCH', 'DELETE'])
+      res.status(405).json({
+        error: { message: `Method ${method} Not Allowed` }
       })
   }
+}
+
+/**
+ * PATCH /api/v1/projects/{ref}/functions/{slug}
+ * Studio's verify_jwt Switch lands here. Forwards verify_jwt / name /
+ * import_map to tenant-manager which owns the metadata table consumed by
+ * Kong's pre-function on every /functions/v1/{slug} request.
+ */
+async function handlePatch(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  context: ProjectIsolationContext,
+) {
+  const { projectRef } = context
+  const slug = req.query.slug
+  if (!slug || typeof slug !== 'string') {
+    return res.status(400).json({ error: { message: 'Function slug is required' } })
+  }
+  const body = req.body ?? {}
+  const allowedKeys = ['verify_jwt', 'import_map', 'name'] as const
+  const payload: Record<string, unknown> = {}
+  for (const key of allowedKeys) {
+    if (key in body) payload[key] = body[key]
+  }
+  if (Object.keys(payload).length === 0) {
+    return res.status(400).json({ error: { message: 'At least one of verify_jwt, import_map, name must be provided' } })
+  }
+  if ('verify_jwt' in payload && typeof payload.verify_jwt !== 'boolean') {
+    return res.status(400).json({ error: { message: 'verify_jwt must be a boolean' } })
+  }
+  if ('import_map' in payload && typeof payload.import_map !== 'boolean') {
+    return res.status(400).json({ error: { message: 'import_map must be a boolean' } })
+  }
+
+  const resp = await tenantManagerFetch<FunctionMetadataRow>(
+    `/admin/v1/projects/${projectRef}/functions/${slug}`,
+    { method: 'PATCH', body: JSON.stringify(payload) },
+  )
+  if (resp.error) {
+    return res.status(resp.error.statusCode || 500).json({
+      error: { message: resp.error.message, code: resp.error.code },
+    })
+  }
+  return res.status(200).json(resp.data ?? {})
 }
 
 const handleGet = async (req: NextApiRequest, res: NextApiResponse, context: ProjectIsolationContext) => {
@@ -130,6 +206,7 @@ const handleGet = async (req: NextApiRequest, res: NextApiResponse, context: Pro
         // Continue with basic metadata only for other errors
       }
 
+      const verifyJwt = await fetchVerifyJwt(projectRef, slug)
       // Enhanced API response format with better metadata
       const functionData = {
         id: functionMetadata.slug, // Use slug as ID for compatibility
@@ -143,7 +220,7 @@ const handleGet = async (req: NextApiRequest, res: NextApiResponse, context: Pro
         updated_at: new Date(functionMetadata.updatedAt).getTime(),
         entrypoint_path: functionMetadata.entrypoint,
         runtime: functionMetadata.runtime,
-        verify_jwt: false, // Default value, can be made configurable
+        verify_jwt: verifyJwt,
         import_map: hasImportMap,
         import_map_path: importMapPath,
         // Enhanced metadata for better function management
@@ -201,7 +278,7 @@ const handleGet = async (req: NextApiRequest, res: NextApiResponse, context: Pro
           updated_at: new Date(functionInfo.metadata.updatedAt || fallbackMetadata.updatedAt).getTime(),
           entrypoint_path: functionInfo.metadata.entrypoint || fallbackMetadata.entrypoint,
           runtime: functionInfo.metadata.runtime || fallbackMetadata.runtime,
-          verify_jwt: false,
+          verify_jwt: await fetchVerifyJwt(projectRef, slug),
           import_map: functionInfo.files.some(file => file.name === 'import_map.json'),
           import_map_path: functionInfo.files.some(file => file.name === 'import_map.json') ? 'import_map.json' : undefined,
           file_count: functionInfo.files.length,

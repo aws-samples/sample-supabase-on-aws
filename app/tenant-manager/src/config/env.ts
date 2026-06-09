@@ -37,6 +37,7 @@ const envSchema = z.object({
   API_JWT_SECRET: z.string().optional(),
   SUPAVISOR_URL: z.string().default('http://supavisor:4000'),
   SUPAVISOR_API_KEY: z.string().optional(),
+  STORAGE_ADMIN_URL: z.string().default('http://storage-api.supabase.local:5001'),
 
   // Pooler configuration
   POOLER_DEFAULT_POOL_SIZE: z.string().default('15').transform(Number),

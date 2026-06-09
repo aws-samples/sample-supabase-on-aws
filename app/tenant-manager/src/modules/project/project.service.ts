@@ -17,6 +17,8 @@ import {
   type ListProjectsOptions,
 } from '../../db/repositories/project.repository.js'
 import { generateProjectRef, generateDbName, generateJwtSecret } from '../../common/crypto/key-generator.js'
+import { assertRefAvailable } from './ref-conflict-guard.js'
+import { ConflictError } from '../../common/errors/index.js'
 import { generateOpaqueKey, generateApiKeyJwt } from '../../common/crypto/api-key-generator.js'
 import {
   createProjectDatabase,
@@ -30,6 +32,7 @@ import {
 } from '../../db/repositories/rds-instance.repository.js'
 import { registerSupavisorTenant, deleteSupavisorTenant, getSupavisorTenant } from '../../integrations/supavisor/supavisor.client.js'
 import { registerRealtimeTenant, deleteRealtimeTenant, getRealtimeTenant } from '../../integrations/realtime/realtime.client.js'
+import { registerStorageTenant, deleteStorageTenant } from '../../integrations/storage/storage.client.js'
 import { registerAuthTenant, deleteAuthTenant, isAuthMultiTenantEnabled, getAuthTenant } from '../../integrations/auth/auth.client.js'
 import { getSecretsStore } from '../../integrations/secrets-manager/index.js'
 import type {
@@ -170,6 +173,12 @@ async function rollback(
  */
 export async function provisionProject(input: CreateProjectInput): Promise<ProvisioningResult> {
   const ref = input.ref || generateProjectRef()
+
+  // Block reuse of a ref that still has residue (DB row, Secrets Manager doc,
+  // or Kong consumer) from a prior teardown. See ref-conflict-guard.ts for
+  // rationale and the May 6 observation it addresses.
+  await assertRefAvailable(ref)
+
   const dbName = generateDbName(ref)
   const jwtSecret = generateJwtSecret()
   const errors: string[] = []
@@ -341,6 +350,16 @@ export async function provisionProject(input: CreateProjectInput): Promise<Provi
       console.debug(`Registered Realtime tenant for ${ref}`)
     }
 
+    // Register with Storage (best-effort: storage is additive, failures here
+    // must not abort project creation).
+    const storageResult = await registerStorageTenant(tenantConfig)
+    if (!storageResult.success) {
+      console.warn(`Warning: Failed to register Storage tenant: ${storageResult.error}`)
+    } else {
+      state.storageTenant = true
+      console.debug(`Registered Storage tenant for ${ref}`)
+    }
+
     // Register with Auth (if multi-tenant mode is enabled)
     if (isAuthMultiTenantEnabled()) {
       const authResult = await registerAuthTenant(tenantConfig)
@@ -477,6 +496,14 @@ export async function provisionProject(input: CreateProjectInput): Promise<Provi
       api_keys: apiKeysCreated,
     }
   } catch (error) {
+    // Pre-flight ConflictError (from assertRefAvailable) means we never got
+    // past validation and have nothing to roll back. Re-throw so the route
+    // layer responds with the original 409 + code instead of swallowing it
+    // into a generic 500. Same logic for any other tenant-manager 4xx error.
+    if (error instanceof ConflictError) {
+      throw error
+    }
+
     const errorMessage = error instanceof Error ? error.message : 'Unknown error during provisioning'
     console.error(`Error provisioning project ${ref}: ${errorMessage}`)
 
@@ -546,6 +573,15 @@ export async function deprovisionProject(ref: string): Promise<ProvisioningResul
       errors.push(`Supavisor: ${supavisorResult.error}`)
     } else {
       console.debug(`Deleted Supavisor tenant for ${ref}`)
+    }
+
+    // 3.1 Delete from Storage (idempotent: 404 treated as success)
+    const storageResult = await deleteStorageTenant(ref)
+    if (!storageResult.success) {
+      console.warn(`Warning: Failed to delete Storage tenant: ${storageResult.error}`)
+      errors.push(`Storage: ${storageResult.error}`)
+    } else {
+      console.debug(`Deleted Storage tenant for ${ref}`)
     }
 
     // 3.5 Delete Edge Functions (before deleting database)
@@ -670,6 +706,7 @@ export async function pauseProject(ref: string): Promise<ProvisioningResult> {
 
   await deleteSupavisorTenant(ref)
   await deleteRealtimeTenant(ref)
+  await deleteStorageTenant(ref)
   if (isAuthMultiTenantEnabled()) {
     await deleteAuthTenant(ref)
   }
@@ -743,6 +780,7 @@ export async function restoreProject(ref: string): Promise<ProvisioningResult> {
 
   await registerSupavisorTenant(tenantConfig)
   await registerRealtimeTenant(tenantConfig)
+  await registerStorageTenant(tenantConfig)
   if (isAuthMultiTenantEnabled()) {
     await registerAuthTenant(tenantConfig)
   }

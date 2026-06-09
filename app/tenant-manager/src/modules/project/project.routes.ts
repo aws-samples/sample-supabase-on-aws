@@ -2,7 +2,7 @@
  * Project management routes
  */
 
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import { createAuthPreHandler } from '../../common/middleware/auth.middleware.js'
 import { validateBody, validateQuery, validateParams } from '../../common/validation/middleware.js'
@@ -59,6 +59,10 @@ export async function projectRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request, reply) => {
       const input = request.body as z.infer<typeof createProjectSchema>
+      // ConflictError is thrown by assertRefAvailable before any side
+      // effects; it propagates straight to the fastify error handler which
+      // emits a 409 with the original code. Anything else returns inside
+      // ProvisioningResult.error.
       const result = await provisionProject(input)
 
       if (!result.success) {
@@ -169,28 +173,34 @@ export async function projectRoutes(fastify: FastifyInstance): Promise<void> {
     }
   )
 
-  // Restore project
-  fastify.post(
-    '/admin/v1/projects/:ref/restore',
-    {
-      preHandler: [authPreHandler, validateParams(projectRefSchema)],
-    },
-    async (request, _reply) => {
-      const { ref } = request.params as z.infer<typeof projectRefSchema>
-      const result = await restoreProject(ref)
+  // Restore project (canonical) and /resume (PDF §3.a alias).
+  // Both verbs share the same handler so existing callers and the documented
+  // verb in the v2 spec resolve to identical semantics.
+  const restoreHandler = async (request: FastifyRequest, _reply: FastifyReply) => {
+    const { ref } = request.params as z.infer<typeof projectRefSchema>
+    const result = await restoreProject(ref)
 
-      if (!result.success) {
-        if (result.error?.includes('not found')) {
-          throw new NotFoundError(result.error)
-        }
-        throw new BadRequestError(result.error || 'Failed to restore project')
+    if (!result.success) {
+      if (result.error?.includes('not found')) {
+        throw new NotFoundError(result.error)
       }
-
-      return {
-        data: result.project,
-      }
+      throw new BadRequestError(result.error || 'Failed to restore project')
     }
-  )
+
+    return {
+      data: result.project,
+    }
+  }
+
+  for (const path of ['/admin/v1/projects/:ref/restore', '/admin/v1/projects/:ref/resume']) {
+    fastify.post(
+      path,
+      {
+        preHandler: [authPreHandler, validateParams(projectRefSchema)],
+      },
+      restoreHandler,
+    )
+  }
 
   // Get database credentials for a project
   fastify.get(

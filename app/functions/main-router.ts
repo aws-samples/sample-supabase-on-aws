@@ -84,6 +84,110 @@ async function getProjectSecrets(projectRef: string): Promise<Record<string, str
   }
 }
 
+/**
+ * Classify a worker error into a precise HTTP status + structured body.
+ *
+ * Background (二期 PDF §6): the old handler collapsed three distinct failures
+ * into a single 404 {"msg":"Function not found"}:
+ *   - the function directory / entrypoint genuinely does not exist
+ *   - the user's code has a SYNTAX error (Edge Runtime cannot parse it)
+ *   - the worker fails to boot for another reason
+ * Users hit a syntax error in their own code, saw "Function not found", and
+ * filed it as a platform bug. We now split these so the response itself tells
+ * the user whether the file is missing (404) or their code is broken (422),
+ * and always surface the raw runtime error in `detail`.
+ *
+ * IMPORTANT ordering: boot/parse errors are checked FIRST, because their
+ * messages frequently also contain the substring "not found" (e.g. a module
+ * import that fails to resolve), which would otherwise be misclassified as 404.
+ */
+function classifyWorkerError(
+  errMsg: string,
+  functionPath: string,
+): { status: number; code: string; body: Record<string, unknown> } {
+  const lower = errMsg.toLowerCase()
+
+  // 1) Missing function / entrypoint → 404. This MUST come before the boot
+  //    error check, because edge-runtime reports a missing entrypoint *inside*
+  //    a "worker boot error" envelope, e.g.:
+  //      "worker boot error: failed to bootstrap runtime: could not find an
+  //       appropriate entrypoint"
+  //    That is a genuinely-missing function, not a user code error — so we
+  //    detect the entrypoint/not-found signal first and return 404.
+  const notFoundSignals = [
+    "could not find an appropriate entrypoint",
+    "entrypoint",
+    "no such file",
+    "not found",
+    "notfound",
+  ]
+  if (notFoundSignals.some((s) => lower.includes(s))) {
+    return {
+      status: 404,
+      code: "FUNCTION_NOT_FOUND",
+      body: {
+        code: "FUNCTION_NOT_FOUND",
+        msg: "Function not found",
+        function: functionPath,
+      },
+    }
+  }
+
+  // 2) Code-level boot / parse / graph errors → 422 (user's code is broken).
+  //    Samples from production logs (PDF §6):
+  //      "failed to create the graph: ... source code could not be parsed: Expected ',', got '...'"
+  //      "Parenthesized expression cannot be empty"
+  const bootSignals = [
+    "boot error",
+    "failed to create the graph",
+    "source code could not be parsed",
+    "failed to bootstrap runtime",
+    "expected ",          // "Expected ',', got ..."
+    "parenthesized expression",
+    "syntaxerror",
+    "unexpected token",
+    "unexpected eof",
+  ]
+  if (bootSignals.some((s) => lower.includes(s))) {
+    return {
+      status: 422,
+      code: "FUNCTION_BOOT_ERROR",
+      body: {
+        code: "FUNCTION_BOOT_ERROR",
+        msg: "Function failed to start due to an error in the function code",
+        function: functionPath,
+        detail: errMsg,
+      },
+    }
+  }
+
+  // 3) Worker timeout → 504.
+  if (lower.includes("timeout") || lower.includes("timed out")) {
+    return {
+      status: 504,
+      code: "FUNCTION_TIMEOUT",
+      body: {
+        code: "FUNCTION_TIMEOUT",
+        msg: "Function execution timed out",
+        function: functionPath,
+        detail: errMsg,
+      },
+    }
+  }
+
+  // 4) Anything else → 500, still surfacing the raw message for diagnosis.
+  return {
+    status: 500,
+    code: "INTERNAL_ERROR",
+    body: {
+      code: "INTERNAL_ERROR",
+      msg: "Internal server error",
+      function: functionPath,
+      detail: errMsg,
+    },
+  }
+}
+
 console.log(`Functions service: WORKER_CACHE=disabled, MEMORY=${WORKER_MEMORY_MB}MB, TIMEOUT=${WORKER_TIMEOUT_MS}ms`)
 
 serve(async (req) => {
@@ -168,17 +272,12 @@ serve(async (req) => {
     }
   } catch (e) {
     const errMsg = e.toString()
-    // 函数不存在或入口文件找不到 → 404
-    if (errMsg.includes("entrypoint") || errMsg.includes("not found") || errMsg.includes("NotFound") || errMsg.includes("boot error")) {
-      return new Response(
-        JSON.stringify({msg: "Function not found", function: functionPath}),
-        {status: 404, headers: {"Content-Type": "application/json"}}
-      )
-    }
-    console.error(`Worker error for ${servicePath}:`, errMsg)
+    const classified = classifyWorkerError(errMsg, functionPath)
+    // boot/语法错误用 warn 级别记录原始信息，便于用户与运维排查
+    console.error(`Worker error for ${servicePath} [${classified.code}]:`, errMsg)
     return new Response(
-      JSON.stringify({msg: "Internal server error"}),
-      {status: 500, headers: {"Content-Type": "application/json"}}
+      JSON.stringify(classified.body),
+      {status: classified.status, headers: {"Content-Type": "application/json"}}
     )
   }
 }, { port: PORT })

@@ -14,6 +14,7 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cw_actions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -117,7 +118,17 @@ interface StackConfig {
         memory: number;
         desiredCount: number;
       };
+      storage?: {
+        cpu: number;
+        memory: number;
+        desiredCount: number;
+      };
     };
+  };
+  storage?: {
+    bucketName?: string;
+    fileSizeLimitBytes?: number;
+    imageTransformationEnabled?: boolean;
   };
   tags: {
     [key: string]: string;
@@ -1115,6 +1126,7 @@ export class SupabaseStack extends cdk.Stack {
         RDS_CA_CERT_PATH: '/etc/ssl/certs/rds-global-bundle.pem',
         NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/rds-global-bundle.pem',
         SUPABASE_SECRETS_PATH: '/home/deno/functions/.supabase/secrets',
+        SUPABASE_BASE_DOMAIN: config.domain.baseDomain,
       },
       secrets: {
         POSTGRES_PASSWORD: ecs.Secret.fromSecretsManager(rdsCluster.secret!, 'password'),
@@ -1230,6 +1242,196 @@ export class SupabaseStack extends cdk.Stack {
         dnsRecordType: servicediscovery.DnsRecordType.A,
       },
     });
+
+    // ========================================
+    // Storage Service (supabase/storage-api in MULTI_TENANT mode)
+    // ========================================
+    // Single S3 bucket shared by every project; tenant isolation lives at the
+    // object-key prefix layer (key = {tenant_id}/{bucket}/{path}/{version}),
+    // matching the upstream behavior. The bucket name is deterministic per
+    // (env, account, region) so re-deploys land on the same bucket.
+    const storageBucketName = config.storage?.bucketName
+      ?? `supabase-storage-${config.project.environment}-${accountId}-${region}`;
+    const storageBucket = new s3.Bucket(this, 'StorageBucket', {
+      bucketName: storageBucketName,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      versioned: false,
+      removalPolicy: isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+      autoDeleteObjects: !isProduction,
+      cors: [
+        {
+          allowedOrigins: ['*'],
+          allowedMethods: [
+            s3.HttpMethods.GET,
+            s3.HttpMethods.PUT,
+            s3.HttpMethods.POST,
+            s3.HttpMethods.DELETE,
+            s3.HttpMethods.HEAD,
+          ],
+          allowedHeaders: ['*'],
+          exposedHeaders: ['ETag', 'Content-Length', 'Content-Type', 'x-amz-version-id'],
+          maxAge: 3600,
+        },
+      ],
+    });
+
+    const storageSG = new ec2.SecurityGroup(this, 'StorageSG', {
+      vpc: vpc,
+      description: 'Security group for storage-api Service',
+      allowAllOutbound: true,
+    });
+
+    // storage-api connects to:
+    //   - Worker Aurora (per-tenant DBs that hold storage.{buckets,objects})
+    //   - Management Aurora (supabase_platform multitenant control DB)
+    workerRdsSG.addIngressRule(
+      storageSG,
+      ec2.Port.tcp(config.workerRds.port),
+      'Allow storage-api to connect to Worker RDS (tenant DBs)'
+    );
+    rdsSG.addIngressRule(
+      storageSG,
+      ec2.Port.tcp(config.rds.port),
+      'Allow storage-api to connect to management RDS (multitenant control)'
+    );
+
+    const storageCpu = config.ecsTaskStack.services.storage?.cpu ?? 512;
+    const storageMemory = config.ecsTaskStack.services.storage?.memory ?? 1024;
+    const storageDesired = config.ecsTaskStack.services.storage?.desiredCount ?? 1;
+
+    const storageTask = new ecs.FargateTaskDefinition(this, 'StorageTask', {
+      cpu: storageCpu,
+      memoryLimitMiB: storageMemory,
+    });
+
+    storageTask.addToExecutionRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'ecr:GetAuthorizationToken',
+          'ecr:BatchCheckLayerAvailability',
+          'ecr:GetDownloadUrlForLayer',
+          'ecr:BatchGetImage',
+        ],
+        resources: ['*'],
+      })
+    );
+
+    // Bucket-scoped S3 permissions for the task role. SDK default credential
+    // chain picks these up automatically when AWS_ACCESS_KEY_ID is unset, so
+    // storage-api never sees explicit keys.
+    storageBucket.grantReadWrite(storageTask.taskRole);
+    storageTask.addToTaskRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:ListBucket', 's3:GetBucketLocation'],
+        resources: [storageBucket.bucketArn],
+      })
+    );
+
+    const storageImageUri = config.infraStack.ecr.repositories['storage']?.uri
+      ? `${config.infraStack.ecr.repositories['storage'].uri}:latest`
+      : `${accountId}.dkr.ecr.${region}.amazonaws.com/storage:latest`;
+
+    storageTask.addContainer('storage', {
+      image: ecs.ContainerImage.fromRegistry(storageImageUri),
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'storage',
+        logGroup: logGroup,
+      }),
+      portMappings: [
+        { containerPort: 5000 },
+        { containerPort: 5001 },
+      ],
+      environment: {
+        NODE_ENV: 'production',
+        SERVER_PORT: '5000',
+        SERVER_ADMIN_PORT: '5001',
+        // Multi-tenant mode: per-request tenant resolution via X-Project-ID
+        // (forked tenant-id.ts patches the upstream X-Forwarded-Host flow to
+        // honour our existing Kong header convention).
+        MULTI_TENANT: 'true',
+        // SSL is configured via DATABASE_SSL_ROOT_CERT (PEM contents) at boot;
+        // we deliberately do NOT put sslmode=verify-ca in the URL so the pg
+        // driver's options don't conflict with storage-api's own ssl handling.
+        DATABASE_MULTITENANT_URL: `postgresql://postgres:__POSTGRES_PASSWORD__@${rdsCluster.clusterEndpoint.hostname}:${config.rds.port}/supabase_platform`,
+        // Backend
+        STORAGE_BACKEND: 's3',
+        STORAGE_S3_BUCKET: storageBucket.bucketName,
+        STORAGE_S3_REGION: region,
+        STORAGE_S3_FORCE_PATH_STYLE: 'false',
+        // Migrations: install storage schema + roles in each tenant DB at
+        // first contact. Idempotent and safe to leave on.
+        DB_INSTALL_ROLES: 'true',
+        DB_ALLOW_MIGRATION_REFRESH: 'true',
+        // Limits
+        UPLOAD_FILE_SIZE_LIMIT: String(config.storage?.fileSizeLimitBytes ?? 52428800),
+        UPLOAD_FILE_SIZE_LIMIT_STANDARD: String(config.storage?.fileSizeLimitBytes ?? 52428800),
+        // Image transformation deferred to a future spec.
+        IMAGE_TRANSFORMATION_ENABLED: String(config.storage?.imageTransformationEnabled ?? false),
+        // Disable optional subsystems to keep the surface area small.
+        PG_QUEUE_ENABLE: 'false',
+        RATE_LIMITER_ENABLED: 'false',
+        // TLS bundle for connections to Aurora. Node honours
+        // NODE_EXTRA_CA_CERTS for outbound HTTPS; storage-api's pg driver
+        // additionally reads DATABASE_SSL_ROOT_CERT (PEM contents). The PEM
+        // file is shipped in the image at /etc/ssl/certs/rds-global-bundle.pem
+        // by the forked Dockerfile.
+        NODE_EXTRA_CA_CERTS: '/etc/ssl/certs/rds-global-bundle.pem',
+        REGION: region,
+      },
+      secrets: {
+        POSTGRES_PASSWORD: ecs.Secret.fromSecretsManager(rdsCluster.secret!, 'password'),
+        AUTH_JWT_SECRET: ecs.Secret.fromSecretsManager(jwtSecret),
+        AUTH_ENCRYPTION_KEY: ecs.Secret.fromSecretsManager(encryptionKey),
+        SERVER_ADMIN_API_KEYS: ecs.Secret.fromSecretsManager(adminApiKeySecret),
+      },
+      entryPoint: ['sh', '-c'],
+      // Boot wiring: inject the Aurora password into DATABASE_MULTITENANT_URL.
+      // NODE_EXTRA_CA_CERTS already loads the RDS CA bundle for the pg driver
+      // before storage-api's TLS handshake runs.
+      command: [
+        'export DATABASE_MULTITENANT_URL=$(echo "$DATABASE_MULTITENANT_URL" | sed "s|__POSTGRES_PASSWORD__|$POSTGRES_PASSWORD|g") && node dist/start/server.js',
+      ],
+      healthCheck: {
+        // /status is the unauthenticated 200-always endpoint exposed at the
+        // top of storage-api's public app (src/app.ts). /health is
+        // tenant-aware and would 5xx without a tenant context, so unsuitable
+        // for ECS task health probes.
+        command: ['CMD-SHELL', 'wget --no-verbose --tries=1 --spider http://localhost:5000/status || exit 1'],
+        interval: cdk.Duration.seconds(30),
+        timeout: cdk.Duration.seconds(5),
+        retries: 3,
+        startPeriod: cdk.Duration.seconds(60),
+      },
+    });
+
+    const storageService = new ecs.FargateService(this, 'StorageService', {
+      cluster: cluster,
+      taskDefinition: storageTask,
+      serviceName: 'storage-api',
+      desiredCount: storageDesired,
+      securityGroups: [storageSG],
+      circuitBreaker: { enable: false },
+      cloudMapOptions: {
+        name: 'storage-api',
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+      },
+    });
+
+    // Tenant-Manager calls the storage Admin API (port 5001) to register /
+    // delete tenants alongside project provisioning.
+    storageSG.addIngressRule(
+      tenantManagerSG,
+      ec2.Port.tcp(5001),
+      'Allow tenant-manager to register/delete storage tenants'
+    );
+
+    // Kong fronts storage at port 5000 (the public API).
+    storageSG.addIngressRule(
+      kongSG,
+      ec2.Port.tcp(5000),
+      'Allow Kong to reach storage-api public API'
+    );
 
     // ========================================
     // Studio Service
@@ -1558,6 +1760,7 @@ export class SupabaseStack extends cdk.Stack {
         KONG_FUNCTIONS_SERVICE_URL: 'http://functions-service.supabase.local:8080',
         KONG_TENANT_MANAGER_URL: 'http://tenant-manager.supabase.local:3001',
         KONG_AUTH_SERVICE_URL: 'http://auth-service.supabase.local:9999',
+        KONG_STORAGE_SERVICE_URL: 'http://storage-api.supabase.local:5000',
         KONG_AWS_REGION: region,
         KONG_UNTRUSTED_LUA: 'on',
         CACHE_BUST: `v${Date.now()}`,

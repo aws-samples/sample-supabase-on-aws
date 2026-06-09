@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint_build:
+    name: Lint & Build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Set up Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+
+  test_postgres:
+    name: Test / Postgres
+    needs: lint_build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Set up Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Prepare env files
+        run: |
+          cp .env.sample .env
+          cp .env.test.sample .env.test
+      - name: Tests pass
+        run: |
+          mkdir -p data && chmod -R 777 data && \
+          npm run test:coverage
+      - name: Upload coverage results to Coveralls
+        uses: coverallsapp/github-action@5cbfd81b66ca5d10c19b062c04de0199c215fb6e # v2.3.7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: coverage/lcov.info
+          format: lcov
+          fail-on-error: false
+        continue-on-error: true
+      - name: Verify migration idempotency
+        env: &migration_idempotency_env
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1/postgres
+        run: |
+          pg_dump "$DATABASE_URL" \
+            --exclude-table-data=storage.migrations \
+            --restrict-key=test \
+            > before.sql
+
+          npm run migration:test-idempotency
+
+          pg_dump "$DATABASE_URL" \
+            --exclude-table-data=storage.migrations \
+            --restrict-key=test \
+            > after.sql
+
+          diff before.sql after.sql || (echo 'Schema mismatch!'; exit 1)
+
+  test_oriole:
+    name: Test / OrioleDB
+    needs: lint_build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+      - name: Set up Node
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+      - name: Install dependencies
+        run: npm ci
+      - name: Prepare env files
+        run: |
+          cp .env.sample .env
+          cp .env.test.sample .env.test
+      - name: Tests pass with OrioleDB
+        run: |
+          mkdir -p data && chmod -R 777 data && \
+          npm run test:oriole
+      - name: Verify OrioleDB migration idempotency
+        env: *migration_idempotency_env
+        run: |
+          docker compose --project-directory . \
+            -f ./.docker/docker-compose-infra.yml \
+            -f ./.docker/docker-compose-infra-oriole-override.yml \
+            exec -T tenant_db \
+            pg_dump -U postgres -d postgres \
+            --exclude-table-data=storage.migrations \
+            --restrict-key=test \
+            > before-oriole.sql
+
+          npm run migration:test-idempotency
+
+          docker compose --project-directory . \
+            -f ./.docker/docker-compose-infra.yml \
+            -f ./.docker/docker-compose-infra-oriole-override.yml \
+            exec -T tenant_db \
+            pg_dump -U postgres -d postgres \
+            --exclude-table-data=storage.migrations \
+            --restrict-key=test \
+            > after-oriole.sql
+
+          diff before-oriole.sql after-oriole.sql || (echo 'Oriole schema mismatch!'; exit 1)

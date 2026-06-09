@@ -14,6 +14,11 @@ infra/lib/*.d.ts
 # Configuration (contains sensitive deployment values)
 config.json
 
+# RDS CA bundle copied into per-service build contexts by build-and-push.sh
+# (build-time artifact; the canonical copy lives at repo-root certs/)
+app/*/certs/
+app/*/*/certs/
+
 # Environment variables
 .env
 .env.local
@@ -52,6 +57,7 @@ scan-results/
 
 # Documentation (local only)
 doc/
+docs/
 
 # Exclude tenant-manager and IDE/AI configs
 .cursor/

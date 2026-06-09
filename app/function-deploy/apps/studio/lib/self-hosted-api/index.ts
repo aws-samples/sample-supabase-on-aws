@@ -25,6 +25,8 @@ export {
   ProjectSecretsStorage,
   accessTokenStorage,
   projectSecretsStorage,
+  SecretsCorruptedError,
+  SecretsLockTimeoutError,
 } from './storage'
 
 // Export environment utilities

@@ -6,7 +6,7 @@ echo "[kong-init] Starting Kong in DB-backed mode..."
 # Step 0: Generate kong.yml from template using envsubst
 if [ -f /tmp/kong.yml.tpl ]; then
     echo "[kong-init] Processing kong.yml.tpl with envsubst..."
-    envsubst '${KONG_FUNCTIONS_SERVICE_URL} ${KONG_TENANT_MANAGER_URL} ${KONG_AUTH_SERVICE_URL} ${KONG_AWS_REGION}' \
+    envsubst '${KONG_FUNCTIONS_SERVICE_URL} ${KONG_TENANT_MANAGER_URL} ${KONG_AUTH_SERVICE_URL} ${KONG_STORAGE_SERVICE_URL} ${KONG_AWS_REGION}' \
       < /tmp/kong.yml.tpl > /tmp/kong.yml
     echo "[kong-init] kong.yml generated successfully"
 else

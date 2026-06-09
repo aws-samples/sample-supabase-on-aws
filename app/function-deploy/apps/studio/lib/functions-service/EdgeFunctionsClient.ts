@@ -20,6 +20,16 @@ import { getFrequencyTracker, FrequencyTracker } from './background-sync/Frequen
 import { getBackgroundSyncService, BackgroundSyncService } from './background-sync/BackgroundSyncService'
 
 /**
+ * Whether a failed `deno check` should block a deploy (二期 PDF §6).
+ * Defaults to ON; set EDGE_FUNCTIONS_STRICT_VALIDATION=false to fall back to
+ * the legacy "warn-and-ship" behavior (e.g. if the deno binary is unavailable
+ * in a given environment and validation produces false negatives).
+ */
+function isStrictValidationEnabled(): boolean {
+  return process.env.EDGE_FUNCTIONS_STRICT_VALIDATION !== 'false'
+}
+
+/**
  * Deployment data for Edge Functions
  */
 export interface DeploymentData {
@@ -357,15 +367,31 @@ export class EdgeFunctionsClient {
           }
         }
 
-        // Deployment succeeded (local write succeeded)
+        // Perform Deno runtime validation and preloading
+        const prep = await this.performDenoRuntimePreparation(projectRef, deploymentData.slug)
+
+        // Strict mode (default ON): reject syntactically-broken code at deploy
+        // time with the real compiler error (PDF §6).
+        if (isStrictValidationEnabled() && !prep.valid) {
+          return {
+            success: false,
+            metadata: dualWriteResult.metadata,
+            error: 'Function code failed validation (deno check). Fix the reported errors and redeploy.',
+            details: {
+              projectRef,
+              functionSlug: deploymentData.slug,
+              code: 'FUNCTION_VALIDATION_FAILED',
+              validationErrors: prep.errors,
+            },
+          }
+        }
+
+        // Deployment succeeded (local write succeeded + validation passed)
         const result: DeploymentResult = {
           success: true,
           metadata: dualWriteResult.metadata,
           warnings: dualWriteResult.warnings,
         }
-
-        // Perform Deno runtime validation and preloading
-        await this.performDenoRuntimePreparation(projectRef, deploymentData.slug)
 
         return result
       }
@@ -404,12 +430,29 @@ export class EdgeFunctionsClient {
       
       // Store function in storage backend first
       await storage.store(projectRef, deploymentData.slug, files, metadata)
-      
+
       // Perform Deno runtime validation and preloading
-      await this.performDenoRuntimePreparation(projectRef, deploymentData.slug)
-      
+      const prep = await this.performDenoRuntimePreparation(projectRef, deploymentData.slug)
+
+      // Strict mode (default ON): a syntax/type error makes the deploy fail at
+      // deploy time with the real compiler error, instead of silently shipping
+      // broken code that later surfaces as a misleading runtime 404 (PDF §6).
+      if (isStrictValidationEnabled() && !prep.valid) {
+        return {
+          success: false,
+          metadata,
+          error: 'Function code failed validation (deno check). Fix the reported errors and redeploy.',
+          details: {
+            projectRef,
+            functionSlug: deploymentData.slug,
+            code: 'FUNCTION_VALIDATION_FAILED',
+            validationErrors: prep.errors,
+          },
+        }
+      }
+
       console.log(`Successfully deployed function '${deploymentData.slug}' to project '${projectRef}' using ${storage.getType()} storage`)
-      
+
       return {
         success: true,
         metadata,
@@ -438,21 +481,44 @@ export class EdgeFunctionsClient {
    * @param projectRef - Project reference
    * @param slug - Function slug
    */
-  private async performDenoRuntimePreparation(projectRef: string, slug: string): Promise<void> {
+  private async performDenoRuntimePreparation(
+    projectRef: string,
+    slug: string,
+  ): Promise<{ valid: boolean; errors: string[] }> {
     const denoRuntime = this.getDenoRuntimeService()
     const storage = this.getLocalStorage() // Always use local storage for Deno runtime
-    
+
     let preparation
     try {
       preparation = await denoRuntime.prepareFunction(storage, projectRef, slug)
-      
-      // Validate TypeScript code
+
+      // Validate TypeScript / syntax via `deno check`. This is the gate that
+      // surfaces user code errors at DEPLOY time (二期 PDF §6) instead of
+      // letting broken code reach the runtime where it used to masquerade as
+      // a misleading 404 "Function not found".
       const validation = await denoRuntime.validateFunction(preparation)
+
+      // Distinguish a real code error from "the deno binary isn't available
+      // here" (the validator spawns `deno check`; if deno is missing it
+      // reports `spawn deno ENOENT`). An infra-missing validator must NOT
+      // block a deploy — otherwise every deploy fails, including valid code.
+      // In that case we degrade to "could not validate" (valid=true) and let
+      // the runtime layer (main-router.ts) classify any real failure later.
+      const isInfraMissing = validation.errors.some((e) =>
+        /spawn .*enoent|failed to validate function|deno: not found|enoent/i.test(e)
+      )
+      if (isInfraMissing) {
+        console.warn(
+          `Function '${slug}': deno validator unavailable (${validation.errors.join('; ')}); ` +
+            `skipping deploy-time syntax gate, runtime will still classify errors.`
+        )
+        return { valid: true, errors: [] }
+      }
+
       if (!validation.valid) {
         console.warn(`Function '${slug}' has TypeScript validation errors:`, validation.errors)
-        // Continue deployment but log warnings
       }
-      
+
       // Preload function dependencies for better performance
       const preloadResult = await denoRuntime.preloadFunction(preparation)
       if (preloadResult.success) {
@@ -461,10 +527,14 @@ export class EdgeFunctionsClient {
         console.warn(`Failed to preload function '${slug}':`, preloadResult.error)
         // Continue deployment even if preloading fails
       }
-      
+
+      return { valid: validation.valid, errors: validation.errors }
     } catch (error: any) {
       console.warn(`Deno runtime preparation failed for function '${slug}':`, error.message)
-      // Continue deployment even if Deno preparation fails
+      // Preparation infrastructure failure (e.g. deno binary missing) must not
+      // be reported as a user syntax error — treat as "could not validate" and
+      // let the deploy proceed (the runtime layer still classifies failures).
+      return { valid: true, errors: [] }
     } finally {
       // Clean up temporary files
       if (preparation) {

@@ -6,7 +6,40 @@
 import fs from 'fs/promises'
 import path from 'path'
 import crypto from 'crypto'
+import lockfile from 'proper-lockfile'
 import type { AccessTokenRecord, ProjectSecretRecord, StorageConfig } from './types'
+
+/**
+ * Thrown when a project secrets file exists on disk but cannot be parsed or
+ * decrypted. Callers must surface a 5xx instead of silently returning [].
+ * Silent fall-through caused B1 (random data loss across ECS tasks).
+ */
+export class SecretsCorruptedError extends Error {
+  constructor(filePath: string, cause: unknown) {
+    super(`Secrets file at ${filePath} could not be read: ${(cause as Error)?.message ?? cause}`)
+    this.name = 'SecretsCorruptedError'
+    if (cause instanceof Error && cause.stack) {
+      this.stack = cause.stack
+    }
+  }
+}
+
+/**
+ * Thrown when the lockfile around a project secrets file cannot be acquired
+ * within the configured retry budget. Callers should surface a 503.
+ */
+export class SecretsLockTimeoutError extends Error {
+  constructor(filePath: string) {
+    super(`Failed to acquire write lock on ${filePath} after retries`)
+    this.name = 'SecretsLockTimeoutError'
+  }
+}
+
+const LOCK_RETRY_OPTS = {
+  retries: { retries: 8, factor: 1.5, minTimeout: 50, maxTimeout: 1500 },
+  stale: 10_000,
+  realpath: false,
+}
 
 /**
  * Default storage configuration for self-hosted environments
@@ -67,6 +100,19 @@ async function ensureDirectory(filePath: string): Promise<void> {
     await fs.access(dir)
   } catch {
     await fs.mkdir(dir, { recursive: true })
+  }
+}
+
+/**
+ * Ensures the target file exists so proper-lockfile can lock it.
+ * Empty files are treated as "no secrets" by the loader.
+ */
+async function ensureFile(filePath: string): Promise<void> {
+  try {
+    await fs.access(filePath)
+  } catch {
+    const handle = await fs.open(filePath, 'a')
+    await handle.close()
   }
 }
 
@@ -169,83 +215,173 @@ export class ProjectSecretsStorage {
   }
   
   /**
-   * Loads secrets for a specific project
+   * Loads secrets for a specific project.
+   *
+   * Returns [] only when the file legitimately does not exist (ENOENT).
+   * Any other failure (decrypt error, malformed JSON, permission error)
+   * surfaces as SecretsCorruptedError so callers can return 5xx instead
+   * of silently dropping a tenant's saved secrets.
    */
   async loadProjectSecrets(projectRef: string): Promise<ProjectSecretRecord[]> {
     const filePath = this.getProjectSecretsPath(projectRef)
-    
+
+    let data: string
     try {
-      await fs.access(filePath)
-      const data = await fs.readFile(filePath, 'utf8')
+      data = await fs.readFile(filePath, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return []
+      }
+      throw new SecretsCorruptedError(filePath, error)
+    }
+
+    try {
       const encryptedSecrets = JSON.parse(data)
-      
-      return encryptedSecrets.map((encrypted: string) => {
+      if (!Array.isArray(encryptedSecrets)) {
+        throw new Error('expected an array of encrypted secrets')
+      }
+      return encryptedSecrets.map((encrypted: unknown) => {
+        if (typeof encrypted !== 'string') {
+          throw new Error('expected each entry to be an encrypted string')
+        }
         const decrypted = decrypt(encrypted, this.config.encryptionKey)
         return JSON.parse(decrypted) as ProjectSecretRecord
       })
     } catch (error) {
-      // File doesn't exist or is empty, return empty array
-      return []
+      throw new SecretsCorruptedError(filePath, error)
     }
   }
-  
+
   /**
-   * Saves secrets for a specific project
+   * Saves secrets atomically using temp-file + rename, guarded by a
+   * proper-lockfile cooperative lock so concurrent writers across ECS
+   * tasks (sharing the same EFS volume) cannot lose updates.
    */
   async saveProjectSecrets(projectRef: string, secrets: ProjectSecretRecord[]): Promise<void> {
     const filePath = this.getProjectSecretsPath(projectRef)
     await ensureDirectory(filePath)
-    
-    const encryptedSecrets = secrets.map(secret => {
-      const serialized = JSON.stringify(secret)
-      return encrypt(serialized, this.config.encryptionKey)
-    })
-    
-    await fs.writeFile(
-      filePath,
-      JSON.stringify(encryptedSecrets, null, 2),
-      'utf8'
-    )
+    // Lockfile requires the target file to exist; touch it if missing.
+    await ensureFile(filePath)
+
+    let release: () => Promise<void>
+    try {
+      release = await lockfile.lock(filePath, LOCK_RETRY_OPTS)
+    } catch (error) {
+      throw new SecretsLockTimeoutError(filePath)
+    }
+
+    try {
+      const encryptedSecrets = secrets.map((secret) => {
+        const serialized = JSON.stringify(secret)
+        return encrypt(serialized, this.config.encryptionKey)
+      })
+      const payload = JSON.stringify(encryptedSecrets, null, 2)
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`
+      await fs.writeFile(tmpPath, payload, 'utf8')
+      await fs.rename(tmpPath, filePath)
+    } finally {
+      await release()
+    }
   }
-  
+
   /**
-   * Updates or creates secrets for a project
+   * Atomically reads-modifies-writes the project secrets file under a single
+   * lock so concurrent writers cannot clobber each other's additions.
    */
   async updateProjectSecrets(
     projectRef: string,
     newSecrets: Array<{ name: string; value: string }>,
     createdBy: string = 'system'
   ): Promise<void> {
-    const existingSecrets = await this.loadProjectSecrets(projectRef)
-    const now = new Date().toISOString()
-    
-    // Create a map of existing secrets for quick lookup
-    const secretsMap = new Map(existingSecrets.map(s => [s.name, s]))
-    
-    // Update or add new secrets
-    newSecrets.forEach(({ name, value }) => {
-      secretsMap.set(name, {
-        name,
-        value,
-        updated_at: now,
-        created_by: createdBy,
-        project_ref: projectRef,
+    await this.mutateUnderLock(projectRef, (existing) => {
+      const now = new Date().toISOString()
+      const secretsMap = new Map(existing.map((s) => [s.name, s]))
+      newSecrets.forEach(({ name, value }) => {
+        secretsMap.set(name, {
+          name,
+          value,
+          updated_at: now,
+          created_by: createdBy,
+          project_ref: projectRef,
+        })
       })
+      return Array.from(secretsMap.values())
     })
-    
-    await this.saveProjectSecrets(projectRef, Array.from(secretsMap.values()))
   }
-  
+
   /**
-   * Removes secrets from a project
+   * Atomically removes secrets under a single lock.
    */
   async removeProjectSecrets(projectRef: string, secretNames: string[]): Promise<void> {
-    const existingSecrets = await this.loadProjectSecrets(projectRef)
-    const filteredSecrets = existingSecrets.filter(
-      secret => !secretNames.includes(secret.name)
+    const remove = new Set(secretNames)
+    await this.mutateUnderLock(projectRef, (existing) =>
+      existing.filter((secret) => !remove.has(secret.name))
     )
-    
-    await this.saveProjectSecrets(projectRef, filteredSecrets)
+  }
+
+  /**
+   * Acquires the project lock once for the read-modify-write cycle so two
+   * concurrent updateProjectSecrets calls don't race between load and save.
+   */
+  private async mutateUnderLock(
+    projectRef: string,
+    transform: (existing: ProjectSecretRecord[]) => ProjectSecretRecord[]
+  ): Promise<void> {
+    const filePath = this.getProjectSecretsPath(projectRef)
+    await ensureDirectory(filePath)
+    await ensureFile(filePath)
+
+    let release: () => Promise<void>
+    try {
+      release = await lockfile.lock(filePath, LOCK_RETRY_OPTS)
+    } catch (error) {
+      throw new SecretsLockTimeoutError(filePath)
+    }
+
+    try {
+      const existing = await this.loadProjectSecretsUnsafe(filePath)
+      const next = transform(existing)
+      const encryptedSecrets = next.map((secret) => {
+        const serialized = JSON.stringify(secret)
+        return encrypt(serialized, this.config.encryptionKey)
+      })
+      const payload = JSON.stringify(encryptedSecrets, null, 2)
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`
+      await fs.writeFile(tmpPath, payload, 'utf8')
+      await fs.rename(tmpPath, filePath)
+    } finally {
+      await release()
+    }
+  }
+
+  private async loadProjectSecretsUnsafe(filePath: string): Promise<ProjectSecretRecord[]> {
+    let data: string
+    try {
+      data = await fs.readFile(filePath, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return []
+      }
+      throw new SecretsCorruptedError(filePath, error)
+    }
+    if (data.trim().length === 0) {
+      return []
+    }
+    try {
+      const encryptedSecrets = JSON.parse(data)
+      if (!Array.isArray(encryptedSecrets)) {
+        throw new Error('expected an array of encrypted secrets')
+      }
+      return encryptedSecrets.map((encrypted: unknown) => {
+        if (typeof encrypted !== 'string') {
+          throw new Error('expected each entry to be an encrypted string')
+        }
+        const decrypted = decrypt(encrypted, this.config.encryptionKey)
+        return JSON.parse(decrypted) as ProjectSecretRecord
+      })
+    } catch (error) {
+      throw new SecretsCorruptedError(filePath, error)
+    }
   }
   
   /**
