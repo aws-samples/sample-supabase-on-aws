@@ -3,6 +3,7 @@ import { withSecureProjectAccess, ProjectIsolationContext } from 'lib/api/secure
 import { getEdgeFunctionsClient } from 'lib/functions-service/EdgeFunctionsClient'
 import { FunctionFile } from 'lib/functions-service/storage/StorageBackend'
 import { withCORS } from 'lib/functions-service/cors/CORSMiddleware'
+import { tenantManagerFetch } from 'lib/api/tenant-manager'
 import formidable from 'formidable'
 import { promises as fs } from 'fs'
 
@@ -206,6 +207,27 @@ const handleDeploy = async (req: NextApiRequest, res: NextApiResponse, context: 
       })
     }
 
+    // Persist verify_jwt (Phase 2 req #2) so a webhook function can be deployed in ONE
+    // step. Previously verify_jwt was only writable via a separate PATCH, so
+    // deploying never recorded it and the gateway kept rejecting anonymous
+    // (no-apikey) webhook calls. We only call tenant-manager when the caller
+    // explicitly provided verify_jwt; a metadata-write failure does NOT fail the
+    // deploy (the code is already deployed) — it surfaces as a warning instead.
+    let verifyJwt: boolean | undefined
+    if (typeof metadata?.verify_jwt === 'boolean') {
+      verifyJwt = metadata.verify_jwt
+      const metaResp = await tenantManagerFetch(
+        `/admin/v1/projects/${projectRef}/functions/${slug}`,
+        { method: 'PATCH', body: JSON.stringify({ verify_jwt: verifyJwt }) },
+      )
+      if (metaResp.error) {
+        console.warn(
+          `[Deploy] Function ${slug} deployed but failed to persist verify_jwt=${verifyJwt}:`,
+          metaResp.error.message,
+        )
+      }
+    }
+
     // Prepare response with warnings if any
     const responseData: any = {
       slug: deploymentResult.metadata.slug,
@@ -216,6 +238,7 @@ const handleDeploy = async (req: NextApiRequest, res: NextApiResponse, context: 
       deployedAt: deploymentResult.metadata.updatedAt,
       entrypoint: deploymentResult.metadata.entrypoint,
       runtime: deploymentResult.metadata.runtime,
+      ...(verifyJwt !== undefined && { verify_jwt: verifyJwt }),
     }
 
     // Add warnings if present (e.g., S3 write failures in dual-write mode)

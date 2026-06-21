@@ -31,7 +31,7 @@ import {
   updateDatabaseCount,
 } from '../../db/repositories/rds-instance.repository.js'
 import { registerSupavisorTenant, deleteSupavisorTenant, getSupavisorTenant } from '../../integrations/supavisor/supavisor.client.js'
-import { registerRealtimeTenant, deleteRealtimeTenant, getRealtimeTenant } from '../../integrations/realtime/realtime.client.js'
+import { registerRealtimeTenant, deleteRealtimeTenant, getRealtimeTenant, isRealtimeMultiTenantEnabled } from '../../integrations/realtime/realtime.client.js'
 import { registerStorageTenant, deleteStorageTenant } from '../../integrations/storage/storage.client.js'
 import { registerAuthTenant, deleteAuthTenant, isAuthMultiTenantEnabled, getAuthTenant } from '../../integrations/auth/auth.client.js'
 import { getSecretsStore } from '../../integrations/secrets-manager/index.js'
@@ -63,6 +63,7 @@ import {
   upsertApiKey,
   upsertPostgrestConfig,
   deletePlatformProjectData,
+  setPlatformProjectStatus,
 } from '../../db/platform-queries.js'
 
 /**
@@ -702,6 +703,13 @@ export async function pauseProject(ref: string): Promise<ProvisioningResult> {
     return { success: true, project }
   }
 
+  // Only a fully-provisioned, healthy project may be paused. Pausing a project
+  // mid-provisioning (COMING_UP) or mid-teardown (GOING_DOWN) would race with
+  // those flows and leave inconsistent state. Mirrors restoreProject's guard.
+  if (project.status !== 'ACTIVE_HEALTHY') {
+    return { success: false, error: `Project cannot be paused from status '${project.status}'; must be ACTIVE_HEALTHY` }
+  }
+
   await updateProjectStatus(ref, 'PAUSING', 'pausing')
 
   await deleteSupavisorTenant(ref)
@@ -710,6 +718,14 @@ export async function pauseProject(ref: string): Promise<ProvisioningResult> {
   if (isAuthMultiTenantEnabled()) {
     await deleteAuthTenant(ref)
   }
+
+  // Stop the DATA plane: the Kong dynamic-lambda-router gates on the platform
+  // DB `projects.status = 'active'` (getProjectConfig). Flipping it to 'paused'
+  // makes the gateway stop minting JWTs / routing to PostgREST for this project,
+  // so JS SDK / REST access is rejected. The control-plane status above
+  // (_tenant.projects) is a separate table the gateway never reads. Already-
+  // cached configs expire within one Kong cache TTL (default 300s).
+  await setPlatformProjectStatus(ref, 'paused')
 
   await updateProjectStatus(ref, 'PAUSED', 'paused')
 
@@ -726,14 +742,19 @@ export async function restoreProject(ref: string): Promise<ProvisioningResult> {
     return { success: false, error: `Project not found: ${ref}` }
   }
 
-  if (project.status !== 'PAUSED') {
+  // Accept PAUSED (normal) and RESTORING (re-entrant: a previous restore that
+  // failed validation after flipping status — see the validate-before-flip
+  // ordering below, which prevents new stuck states).
+  if (project.status !== 'PAUSED' && project.status !== 'RESTORING') {
     return { success: false, error: `Project is not paused: ${ref}` }
   }
 
   const env = getEnv()
-  await updateProjectStatus(ref, 'RESTORING', 'restoring')
 
-  // Read keys from Secrets Manager
+  // Validate the secret document BEFORE flipping status to RESTORING. Flipping
+  // first and then failing validation left the project stuck in RESTORING with
+  // no path back to PAUSED. Read + validate up front so a bad secret doc returns
+  // 400 while the project stays PAUSED and remains resumable.
   const secretsStore = getSecretsStore()
   const secretDoc = await secretsStore.getProjectSecret(ref)
   if (!secretDoc) {
@@ -754,6 +775,9 @@ export async function restoreProject(ref: string): Promise<ProvisioningResult> {
   const jwtSecret = currentJwtKey.secret
   const anonKey = anonApiKey.jwt
   const serviceRoleKey = serviceApiKey.jwt
+
+  // Secret doc validated — now it is safe to flip to RESTORING.
+  await updateProjectStatus(ref, 'RESTORING', 'restoring')
 
   // Resolve instance-specific password, fall back to global env
   let dbPassword = env.POSTGRES_PASSWORD
@@ -779,11 +803,18 @@ export async function restoreProject(ref: string): Promise<ProvisioningResult> {
   }
 
   await registerSupavisorTenant(tenantConfig)
-  await registerRealtimeTenant(tenantConfig)
+  if (isRealtimeMultiTenantEnabled()) {
+    await registerRealtimeTenant(tenantConfig)
+  }
   await registerStorageTenant(tenantConfig)
   if (isAuthMultiTenantEnabled()) {
     await registerAuthTenant(tenantConfig)
   }
+
+  // Restore the DATA plane: flip the platform DB status back to 'active' so the
+  // Kong router resumes minting JWTs / routing to PostgREST (symmetric to the
+  // 'paused' flip in pauseProject).
+  await setPlatformProjectStatus(ref, 'active')
 
   await updateProjectStatus(ref, 'ACTIVE_HEALTHY', 'completed')
 

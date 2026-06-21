@@ -4,6 +4,34 @@ import { getEdgeFunctionsClient } from 'lib/functions-service/EdgeFunctionsClien
 import { getFunctionListService } from 'lib/functions-service/list/FunctionListService'
 import { FunctionFile } from 'lib/functions-service/storage/StorageBackend'
 import { withCORS } from 'lib/functions-service/cors/CORSMiddleware'
+import { tenantManagerFetch } from 'lib/api/tenant-manager'
+
+/**
+ * Fetch the real verify_jwt flag for every function of a project in ONE call.
+ * The list endpoints used to hard-code verify_jwt:false, which contradicted the
+ * actual stored value (Phase 2 req #2) and misled the Studio UI. tenant-manager's
+ * GET /admin/v1/projects/:ref/functions returns the authoritative rows.
+ * Returns a slug→verify_jwt map; on any failure returns an empty map so callers
+ * fall back to the safe default (true).
+ */
+async function fetchVerifyJwtMap(projectRef: string): Promise<Map<string, boolean>> {
+  try {
+    const resp = await tenantManagerFetch<Array<{ slug: string; verify_jwt: boolean }>>(
+      `/admin/v1/projects/${projectRef}/functions`,
+      { method: 'GET' },
+    )
+    if (resp.error || !Array.isArray(resp.data)) {
+      if (resp.error) {
+        console.warn(`[Functions] verify_jwt lookup failed for ${projectRef}, defaulting to true:`, resp.error.message)
+      }
+      return new Map()
+    }
+    return new Map(resp.data.map((r) => [r.slug, r.verify_jwt]))
+  } catch (error) {
+    console.warn(`[Functions] verify_jwt lookup threw for ${projectRef}, defaulting to true:`, error)
+    return new Map()
+  }
+}
 
 export default withCORS(
   withSecureProjectAccess(handler, {
@@ -43,6 +71,10 @@ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse, context: 
       // Get all functions with enhanced metadata normalization and deployment source detection
       const functions = await functionListService.getAllFunctions(projectRef)
 
+      // Resolve real verify_jwt flags from tenant-manager (Phase 2 req #2): the value
+      // below used to be hard-coded false, contradicting actual storage.
+      const verifyJwtMap = await fetchVerifyJwtMap(projectRef)
+
       // Transform enhanced metadata to API response format matching FunctionResponse schema
       const functionsData = functions.map(metadata => {
         // Enhanced API response with comprehensive metadata
@@ -58,7 +90,7 @@ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse, context: 
           updated_at: new Date(metadata.updatedAt).getTime(),
           entrypoint_path: metadata.entrypoint,
           runtime: metadata.runtime,
-          verify_jwt: false, // Default value, can be made configurable
+          verify_jwt: verifyJwtMap.get(metadata.slug) ?? true, // real value (safe default true)
           import_map: false, // Will be updated when we have import map detection
           import_map_path: undefined, // Will be updated when we have import map detection
           
@@ -110,6 +142,9 @@ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse, context: 
         const edgeFunctionsClient = getEdgeFunctionsClient()
         const functions = await edgeFunctionsClient.list(projectRef)
 
+        // Resolve real verify_jwt flags here too (Phase 2 req #2).
+        const verifyJwtMap = await fetchVerifyJwtMap(projectRef)
+
         // Transform fallback data to API response format
         const fallbackData = functions.map(func => ({
           id: func.slug,
@@ -123,7 +158,7 @@ const handleGetAll = async (req: NextApiRequest, res: NextApiResponse, context: 
           updated_at: new Date(func.updatedAt || Date.now()).getTime(),
           entrypoint_path: func.entrypoint || 'index.ts',
           runtime: func.runtime || 'deno',
-          verify_jwt: false,
+          verify_jwt: verifyJwtMap.get(func.slug) ?? true,
           import_map: false,
           import_map_path: undefined,
           project_ref: func.projectRef || projectRef,

@@ -79,6 +79,26 @@ export async function updatePlatformProject(
   )
 }
 
+/**
+ * Set only the status of a platform project row.
+ *
+ * The Kong data-plane router gates on `projects.status = 'active'`
+ * (see getProjectConfig below), so pausing a project must flip this to a
+ * non-active value ('paused') to stop the gateway from minting JWTs / routing
+ * to its Lambda, and resume must flip it back to 'active'. This is the missing
+ * data-plane half of pause/resume — the control-plane `_tenant.projects` status
+ * is a separate table that the gateway never reads.
+ */
+export async function setPlatformProjectStatus(
+  projectId: string,
+  status: string,
+): Promise<void> {
+  await platformQuery(
+    `UPDATE projects SET status = $2 WHERE id = $1`,
+    [projectId, status],
+  )
+}
+
 // ---------------------------------------------------------------------------
 // 3. upsertJwtKey
 // ---------------------------------------------------------------------------
