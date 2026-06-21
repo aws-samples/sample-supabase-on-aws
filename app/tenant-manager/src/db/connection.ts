@@ -30,6 +30,11 @@ export function getManagementDb(): Kysely<Database> {
   if (!managementDb) {
     const config = getManagementPoolConfig()
     managementPool = new Pool(config)
+    // Guard against uncaught 'error' from server-terminated idle connections
+    // (Aurora failover / idle timeout) crashing the process.
+    managementPool.on('error', (err) => {
+      console.error('[management-db] Unexpected pool error:', err.message)
+    })
     managementDb = new Kysely<Database>({
       dialect: new PostgresDialect({
         pool: managementPool,
@@ -47,6 +52,10 @@ export function getSystemPool(): pg.Pool {
   if (!systemPool) {
     const config = getSystemPoolConfig()
     systemPool = new Pool(config)
+    // Guard against uncaught 'error' from server-terminated idle connections.
+    systemPool.on('error', (err) => {
+      console.error('[system-db] Unexpected pool error:', err.message)
+    })
   }
   return systemPool
 }

@@ -8,7 +8,35 @@ const PORT = parseInt(Deno.env.get("PORT") || "8080")
 
 // Secrets 存储配置
 const SECRETS_PATH = Deno.env.get("SUPABASE_SECRETS_PATH") || "/home/deno/functions/.supabase/secrets"
-const ENCRYPTION_KEY = Deno.env.get("SUPABASE_ENCRYPTION_KEY") || "default-key-change-in-production"
+// fail-fast: the encryption key MUST be provided. A hard-coded fallback meant
+// that a misconfigured deploy would silently derive a publicly-known key and
+// decrypt every tenant's secrets with it. CDK injects this from Secrets Manager
+// (ecs.Secret.fromSecretsManager), so a correctly-deployed container always has it.
+const ENCRYPTION_KEY_RAW = Deno.env.get("SUPABASE_ENCRYPTION_KEY")
+if (!ENCRYPTION_KEY_RAW) {
+  console.error("FATAL: SUPABASE_ENCRYPTION_KEY is not set. Refusing to start with an insecure default.")
+  Deno.exit(1)
+}
+// Narrowed to string: execution only reaches here when the key is present
+// (Deno.exit above terminates the process otherwise).
+const ENCRYPTION_KEY: string = ENCRYPTION_KEY_RAW
+
+// SECURITY (tenant isolation): the worker runs UNTRUSTED tenant-supplied code,
+// so the host process env is an allowlist, NOT a denylist. A denylist would
+// have to enumerate every present and future sensitive var — and it already
+// misses things like ECS_CONTAINER_METADATA_URI(_V4) and
+// AWS_CONTAINER_CREDENTIALS_RELATIVE_URI (task IAM-role credential entrypoints),
+// which would let tenant code assume the task role or read platform metadata.
+// We forward ONLY the host vars explicitly named in WORKER_ENV_ALLOWLIST
+// (comma-separated), and never anything else. The platform master key
+// SUPABASE_ENCRYPTION_KEY and the secrets path stay on the host only. A tenant
+// function's own config arrives via projectSecrets, which is merged separately.
+const WORKER_ENV_ALLOWLIST = new Set(
+  (Deno.env.get("WORKER_ENV_ALLOWLIST") || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0),
+)
 
 // Secrets 缓存（每个项目缓存 60 秒）
 const secretsCache = new Map<string, { secrets: Record<string, string>, expiry: number }>()
@@ -245,9 +273,18 @@ serve(async (req) => {
       projectSecrets = await getProjectSecrets(projectRef)
     }
     
-    // 合并容器环境变量和项目 secrets
-    // 项目 secrets 优先级更高，会覆盖同名的容器环境变量
-    const baseEnvVars = Deno.env.toObject()
+    // Build the worker env from an ALLOWLIST of host vars (default: none), then
+    // merge the tenant's own secrets on top (projectSecrets wins on conflict).
+    // Previously the ENTIRE host env (incl. SUPABASE_ENCRYPTION_KEY, the master
+    // key that decrypts all tenants' secrets) was forwarded verbatim, so any
+    // tenant function could read Deno.env and exfiltrate it. Now only explicitly
+    // allowlisted host vars cross the boundary.
+    const hostEnv = Deno.env.toObject()
+    const baseEnvVars: Record<string, string> = {}
+    for (const name of WORKER_ENV_ALLOWLIST) {
+      const v = hostEnv[name]
+      if (v !== undefined) baseEnvVars[name] = v
+    }
     const mergedEnvVars = { ...baseEnvVars, ...projectSecrets }
     
     // 每次创建新 worker（无缓存）

@@ -41,7 +41,20 @@ vi.mock('../../src/modules/project/project.service.js', () => ({
   }),
 }))
 
+// createApiKey now also writes the platform DB (Kong key-auth source) and
+// registers the Kong consumer, so a freshly created key is actually usable.
+vi.mock('../../src/db/platform-queries.js', () => ({
+  upsertApiKey: vi.fn().mockResolvedValue(undefined),
+  getApiKeysByProjectId: vi.fn().mockResolvedValue([]),
+}))
+
+vi.mock('../../src/integrations/kong/kong-admin.client.js', () => ({
+  registerProjectConsumer: vi.fn().mockResolvedValue(undefined),
+}))
+
 import { createApiKey, listApiKeys, getApiKey, revokeApiKey } from '../../src/modules/api-keys/api-key.service.js'
+import { upsertApiKey, getApiKeysByProjectId } from '../../src/db/platform-queries.js'
+import { registerProjectConsumer } from '../../src/integrations/kong/kong-admin.client.js'
 
 function makeSecretDoc(overrides?: Partial<ProjectSecretDocument>): ProjectSecretDocument {
   return {
@@ -99,6 +112,37 @@ describe('api-key.service', () => {
       const savedDoc = vi.mocked(mockSecretsStore.putProjectSecret).mock.calls[0]![1]
       expect(savedDoc.api_keys).toHaveLength(1)
       expect(savedDoc.api_keys[0]!.status).toBe('active')
+
+      // Core bug fix: the new key must also be written to the platform DB AND
+      // registered in Kong, otherwise the returned opaque key 401s at the gateway.
+      expect(upsertApiKey).toHaveBeenCalledWith(
+        'test-project', 'My Key', 'publishable', 'anon', result.opaque_key, expect.any(String),
+      )
+      expect(registerProjectConsumer).toHaveBeenCalledWith('test-project', 'anon', result.opaque_key)
+    })
+
+    it('should replace the prior active key of the same role (one active key per role)', async () => {
+      const doc = makeSecretDoc({
+        api_keys: [
+          {
+            id: 'old-anon', project_ref: 'test-project', name: 'Old Anon',
+            type: 'publishable', role: 'anon', prefix: 'sb_publishable_old',
+            hashed_secret: 'oldhash', jwt: 'oldjwt', jwt_key_id: 'jwt-key-1',
+            status: 'active', description: null,
+            created_at: '2025-01-01T00:00:00Z', updated_at: '2025-01-01T00:00:00Z', revoked_at: null,
+          },
+        ],
+      })
+      vi.mocked(mockSecretsStore.getProjectSecret).mockResolvedValue(doc)
+      vi.mocked(mockSecretsStore.putProjectSecret).mockResolvedValue(undefined)
+
+      await createApiKey('test-project', { name: 'New Anon', type: 'publishable', role: 'anon' })
+
+      const savedDoc = vi.mocked(mockSecretsStore.putProjectSecret).mock.calls[0]![1]
+      const oldKey = savedDoc.api_keys.find((k) => k.id === 'old-anon')!
+      expect(oldKey.status).toBe('revoked') // prior active anon key rotated out
+      const activeAnon = savedDoc.api_keys.filter((k) => k.role === 'anon' && k.status === 'active')
+      expect(activeAnon).toHaveLength(1) // exactly one active key per role
     })
 
     it('should throw if project secret not found', async () => {

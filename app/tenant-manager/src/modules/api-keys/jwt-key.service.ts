@@ -8,11 +8,12 @@ import { getSecretsStore } from '../../integrations/secrets-manager/index.js'
 import { resignApiKeyJwt } from '../../common/crypto/api-key-generator.js'
 import { getProjectByRef } from '../project/project.service.js'
 import { registerAuthTenant, isAuthMultiTenantEnabled } from '../../integrations/auth/auth.client.js'
-import { registerRealtimeTenant } from '../../integrations/realtime/realtime.client.js'
+import { registerRealtimeTenant, isRealtimeMultiTenantEnabled } from '../../integrations/realtime/realtime.client.js'
 import { getEnv } from '../../config/index.js'
 import { findRdsInstanceById } from '../../db/repositories/rds-instance.repository.js'
 import { resolveInstanceCredentials } from '../../db/instance-connection.js'
-import { NotFoundError, ConflictError } from '../../common/errors/index.js'
+import { NotFoundError, ConflictError, ExternalServiceError } from '../../common/errors/index.js'
+import { upsertJwtKey } from '../../db/platform-queries.js'
 import type { JwtKey, JwtKeyPublicInfo, JwtKeyRotationResult } from '../../types/jwt-key.js'
 
 function toPublicInfo(key: JwtKey): JwtKeyPublicInfo {
@@ -138,6 +139,12 @@ export async function rotateJwtKeys(projectRef: string): Promise<JwtKeyRotationR
   // Save the updated document
   await secretsStore.putProjectSecret(projectRef, doc)
 
+  // Sync the new current secret into the platform DB jwt_keys table. PostgREST
+  // (and Kong) read the signing secret from there; without this update they
+  // keep validating with the OLD secret, so freshly re-signed tokens are
+  // rejected at /rest/v1 while passing elsewhere. This is the core rotation bug.
+  await upsertJwtKey(projectRef, standbyKey.secret)
+
   // Re-register with external services using new jwt_secret
   const env = getEnv()
 
@@ -149,7 +156,15 @@ export async function rotateJwtKeys(projectRef: string): Promise<JwtKeyRotationR
       try {
         const rotateConn = await resolveInstanceCredentials(instance)
         dbPassword = rotateConn.password
-      } catch { /* fall back to env */ }
+      } catch (error) {
+        // Don't silently swallow: log why we fell back to the global password,
+        // otherwise a per-instance credential failure registers GoTrue/Realtime
+        // with the wrong password and is impossible to diagnose.
+        console.error(
+          `[jwt-rotate] Failed to resolve instance ${project.db_instance_id} credentials, falling back to global password:`,
+          error instanceof Error ? error.message : error,
+        )
+      }
     }
   }
 
@@ -164,10 +179,27 @@ export async function rotateJwtKeys(projectRef: string): Promise<JwtKeyRotationR
     serviceRoleKey: doc.api_keys.find((k) => k.role === 'service_role' && k.status === 'active')?.jwt || '',
   }
 
+  // Don't swallow external registration failures: if GoTrue/Realtime keep the
+  // old secret while PostgREST/Secrets Manager have the new one, the tenant ends
+  // up in a split-brain state. Surface it as a 502 so the operator can retry.
   if (isAuthMultiTenantEnabled()) {
-    await registerAuthTenant(tenantConfig)
+    const authResult = await registerAuthTenant(tenantConfig)
+    if (!authResult.success) {
+      throw new ExternalServiceError(
+        `Auth tenant re-registration failed after JWT rotation: ${authResult.error ?? 'unknown error'}`,
+        'auth',
+      )
+    }
   }
-  await registerRealtimeTenant(tenantConfig)
+  if (isRealtimeMultiTenantEnabled()) {
+    const realtimeResult = await registerRealtimeTenant(tenantConfig)
+    if (!realtimeResult.success) {
+      throw new ExternalServiceError(
+        `Realtime tenant re-registration failed after JWT rotation: ${realtimeResult.error ?? 'unknown error'}`,
+        'realtime',
+      )
+    }
+  }
 
   return {
     current: toPublicInfo(standbyKey),

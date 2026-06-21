@@ -63,10 +63,19 @@ vi.mock('../../src/integrations/auth/auth.client.js', () => ({
 
 vi.mock('../../src/integrations/realtime/realtime.client.js', () => ({
   registerRealtimeTenant: vi.fn().mockResolvedValue({ success: true }),
+  isRealtimeMultiTenantEnabled: vi.fn().mockReturnValue(true),
+}))
+
+// rotateJwtKeys now syncs the new secret into the platform DB jwt_keys table.
+vi.mock('../../src/db/platform-queries.js', () => ({
+  upsertJwtKey: vi.fn().mockResolvedValue(undefined),
 }))
 
 import { listJwtKeys, createStandbyKey, rotateJwtKeys } from '../../src/modules/api-keys/jwt-key.service.js'
 import { generateApiKeyJwt } from '../../src/common/crypto/api-key-generator.js'
+import { upsertJwtKey } from '../../src/db/platform-queries.js'
+import { registerAuthTenant, isAuthMultiTenantEnabled } from '../../src/integrations/auth/auth.client.js'
+import { registerRealtimeTenant, isRealtimeMultiTenantEnabled } from '../../src/integrations/realtime/realtime.client.js'
 
 function makeSecretDoc(overrides?: Partial<ProjectSecretDocument>): ProjectSecretDocument {
   return {
@@ -284,6 +293,85 @@ describe('jwt-key.service', () => {
       const savedDoc = vi.mocked(mockSecretsStore.putProjectSecret).mock.calls[0]![1]
       const revokedKey = savedDoc.api_keys.find((k) => k.id === 'api-key-2')!
       expect(revokedKey.jwt).toBe(revokedJwt) // unchanged
+
+      // Core bug fix: the new current secret must be synced into the platform DB
+      // jwt_keys table (PostgREST/Kong read the signing secret from there).
+      const newCurrent = savedDoc.jwt_keys.find((k) => k.status === 'current')!
+      expect(upsertJwtKey).toHaveBeenCalledWith('test-project', newCurrent.secret)
+    })
+
+    it('should throw and not silently swallow when Realtime re-registration fails', async () => {
+      const doc = makeSecretDoc({
+        jwt_keys: [
+          {
+            id: 'jwt-key-current', secret: 'current-secret-value',
+            status: 'current', algorithm: 'HS256',
+            created_at: '2025-01-01T00:00:00Z', rotated_at: null,
+          },
+          {
+            id: 'jwt-key-standby', secret: 'standby-secret-value',
+            status: 'standby', algorithm: 'HS256',
+            created_at: '2025-01-02T00:00:00Z', rotated_at: null,
+          },
+        ],
+      })
+      vi.mocked(mockSecretsStore.getProjectSecret).mockResolvedValue(doc)
+      vi.mocked(mockSecretsStore.putProjectSecret).mockResolvedValue(undefined)
+      vi.mocked(registerRealtimeTenant).mockResolvedValueOnce({ success: false, error: 'realtime down' })
+
+      await expect(rotateJwtKeys('test-project')).rejects.toThrow(/Realtime tenant re-registration failed/)
+    })
+
+    it('should skip Realtime registration (not throw) when Realtime is disabled', async () => {
+      // Default: Realtime not deployed (REALTIME_MULTI_TENANT=false). Rotation
+      // must succeed and never call Realtime, so a dead REALTIME_URL can't 502 it.
+      vi.mocked(isRealtimeMultiTenantEnabled).mockReturnValueOnce(false)
+      const doc = makeSecretDoc({
+        jwt_keys: [
+          {
+            id: 'jwt-key-current', secret: 'current-secret-value',
+            status: 'current', algorithm: 'HS256',
+            created_at: '2025-01-01T00:00:00Z', rotated_at: null,
+          },
+          {
+            id: 'jwt-key-standby', secret: 'standby-secret-value',
+            status: 'standby', algorithm: 'HS256',
+            created_at: '2025-01-02T00:00:00Z', rotated_at: null,
+          },
+        ],
+      })
+      vi.mocked(mockSecretsStore.getProjectSecret).mockResolvedValue(doc)
+      vi.mocked(mockSecretsStore.putProjectSecret).mockResolvedValue(undefined)
+      // Even if Realtime would fail, it must not be called when disabled.
+      vi.mocked(registerRealtimeTenant).mockResolvedValue({ success: false, error: 'should not be called' })
+
+      const result = await rotateJwtKeys('test-project')
+      expect(result.api_keys_resigned).toBeDefined()
+      expect(registerRealtimeTenant).not.toHaveBeenCalled()
+      expect(upsertJwtKey).toHaveBeenCalled() // platform DB still synced
+    })
+
+    it('should throw when Auth re-registration fails (multi-tenant enabled)', async () => {
+      vi.mocked(isAuthMultiTenantEnabled).mockReturnValueOnce(true)
+      vi.mocked(registerAuthTenant).mockResolvedValueOnce({ success: false, error: 'auth down' })
+      const doc = makeSecretDoc({
+        jwt_keys: [
+          {
+            id: 'jwt-key-current', secret: 'current-secret-value',
+            status: 'current', algorithm: 'HS256',
+            created_at: '2025-01-01T00:00:00Z', rotated_at: null,
+          },
+          {
+            id: 'jwt-key-standby', secret: 'standby-secret-value',
+            status: 'standby', algorithm: 'HS256',
+            created_at: '2025-01-02T00:00:00Z', rotated_at: null,
+          },
+        ],
+      })
+      vi.mocked(mockSecretsStore.getProjectSecret).mockResolvedValue(doc)
+      vi.mocked(mockSecretsStore.putProjectSecret).mockResolvedValue(undefined)
+
+      await expect(rotateJwtKeys('test-project')).rejects.toThrow(/Auth tenant re-registration failed/)
     })
   })
 })

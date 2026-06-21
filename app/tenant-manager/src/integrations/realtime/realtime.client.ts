@@ -126,3 +126,14 @@ export async function checkRealtimeHealth(): Promise<{ healthy: boolean; error?:
 
   return { healthy: result.ok, ...(result.ok ? {} : { error: result.error }) }
 }
+
+/**
+ * Whether Realtime multi-tenant registration is enabled. Mirrors
+ * isAuthMultiTenantEnabled(): when false (default), callers skip Realtime tenant
+ * registration rather than failing, so an undeployed/unreachable Realtime
+ * service (REALTIME_URL dead reference) doesn't break JWT rotation or
+ * provisioning.
+ */
+export function isRealtimeMultiTenantEnabled(): boolean {
+  return getEnv().REALTIME_MULTI_TENANT
+}

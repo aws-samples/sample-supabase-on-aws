@@ -7,7 +7,8 @@ import crypto from 'crypto'
 import { getSecretsStore } from '../../integrations/secrets-manager/index.js'
 import { generateOpaqueKey, generateApiKeyJwt } from '../../common/crypto/api-key-generator.js'
 import { getProjectByRef } from '../project/project.service.js'
-import { getApiKeysByProjectId } from '../../db/platform-queries.js'
+import { getApiKeysByProjectId, upsertApiKey } from '../../db/platform-queries.js'
+import { registerProjectConsumer } from '../../integrations/kong/kong-admin.client.js'
 import { NotFoundError, ConflictError } from '../../common/errors/index.js'
 import type { CreateApiKeyInput, ApiKeyCreatedResponse, ApiKeyListItem, ApiKey } from '../../types/api-key.js'
 
@@ -62,8 +63,28 @@ export async function createApiKey(
     revoked_at: null,
   }
 
+  // Semantics: one active key per role. Kong key-auth and the platform DB
+  // api_keys table are both unique on (project, role), so creating a key for a
+  // role rotates/replaces that role's previous key. Revoke any prior active key
+  // of the same role in the Secrets Manager doc to keep all three stores
+  // (Secrets Manager / platform DB / Kong) consistent.
+  for (const k of doc.api_keys) {
+    if (k.role === input.role && k.status === 'active') {
+      k.status = 'revoked'
+      k.revoked_at = now
+      k.updated_at = now
+    }
+  }
   doc.api_keys.push(newApiKey)
+
+  // Write order: Secrets Manager (source of truth) -> platform DB (Kong
+  // key-auth data source) -> Kong consumer credential. A new opaque key cannot
+  // pass the gateway unless it is registered in BOTH the platform DB and Kong,
+  // which is the bug this fixes. Any failure throws so the caller sees a real
+  // error instead of a silently unusable key.
   await secretsStore.putProjectSecret(projectRef, doc)
+  await upsertApiKey(projectRef, input.name, input.type, input.role, opaqueKey, hashedSecret)
+  await registerProjectConsumer(projectRef, input.role, opaqueKey)
 
   return {
     id: apiKeyId,
@@ -135,8 +156,12 @@ export async function getApiKey(projectRef: string, keyId: string): Promise<ApiK
     return null
   }
 
+  // The platform DB holds exactly one opaque key per (project, role) — the
+  // current active one. Only surface it for the active key; a revoked key must
+  // NOT echo the role's current live opaque (that would leak the active secret).
   const dbKeys = await getApiKeysByProjectId(projectRef)
   const opaqueByRole = new Map(dbKeys.map((k) => [k.role, k.key_value]))
+  const opaqueKey = key.status === 'active' ? (opaqueByRole.get(key.role) ?? '') : ''
 
   return {
     id: key.id,
@@ -145,7 +170,7 @@ export async function getApiKey(projectRef: string, keyId: string): Promise<ApiK
     role: key.role,
     prefix: key.prefix,
     jwt: key.jwt,
-    opaque_key: opaqueByRole.get(key.role) ?? '',
+    opaque_key: opaqueKey,
     status: key.status,
     description: key.description,
     created_at: key.created_at,

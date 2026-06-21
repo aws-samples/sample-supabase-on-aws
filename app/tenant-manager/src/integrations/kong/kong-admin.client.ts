@@ -76,6 +76,31 @@ async function setAclGroup(consumerUsername: string, group: string): Promise<voi
   })
 }
 
+// ACL group for each role. anon consumers join the 'anon' group; service_role
+// consumers join 'admin' (matches Kong route ACL config).
+const ACL_GROUP_BY_ROLE: Record<'anon' | 'service_role', string> = {
+  anon: 'anon',
+  service_role: 'admin',
+}
+
+/**
+ * Register (or rotate) the Kong consumer for a single project role.
+ * Consumer naming: {projectRef}--{role}. Because key-auth is (consumer)-scoped
+ * and setKeyAuthCredential replaces existing credentials, calling this again
+ * with a new opaque key atomically rotates that role's key.
+ */
+export async function registerProjectConsumer(
+  projectRef: string,
+  role: 'anon' | 'service_role',
+  opaqueKey: string,
+): Promise<void> {
+  const username = `${projectRef}--${role}`
+  await ensureConsumer(username)
+  await setKeyAuthCredential(username, opaqueKey)
+  await setAclGroup(username, ACL_GROUP_BY_ROLE[role])
+  console.debug(`[kong-admin] Consumer registered for ${username}`)
+}
+
 /**
  * Register both anon and service_role consumers for a project.
  * Consumer naming: {projectRef}--anon, {projectRef}--service_role
@@ -85,16 +110,8 @@ export async function registerProjectConsumers(
   anonKey: string,
   serviceRoleKey: string,
 ): Promise<void> {
-  const anonUsername = `${projectRef}--anon`
-  await ensureConsumer(anonUsername)
-  await setKeyAuthCredential(anonUsername, anonKey)
-  await setAclGroup(anonUsername, 'anon')
-
-  const srUsername = `${projectRef}--service_role`
-  await ensureConsumer(srUsername)
-  await setKeyAuthCredential(srUsername, serviceRoleKey)
-  await setAclGroup(srUsername, 'admin')
-
+  await registerProjectConsumer(projectRef, 'anon', anonKey)
+  await registerProjectConsumer(projectRef, 'service_role', serviceRoleKey)
   console.debug(`[kong-admin] Both consumers registered for project: ${projectRef}`)
 }
 

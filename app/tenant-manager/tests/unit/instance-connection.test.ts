@@ -26,6 +26,7 @@ vi.mock('pg', () => {
       Pool: vi.fn().mockImplementation(() => ({
         end: mockPoolEnd,
         query: mockPoolQuery,
+        on: vi.fn(), // pool error listener registered by getInstanceSystemPool
       })),
       Client: vi.fn().mockImplementation(() => ({
         connect: mockClientConnect,

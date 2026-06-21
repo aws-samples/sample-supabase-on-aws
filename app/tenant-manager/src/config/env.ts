@@ -34,6 +34,11 @@ const envSchema = z.object({
   GOTRUE_ADMIN_KEY: z.string().optional(),
   GOTRUE_MULTI_TENANT: z.string().transform((v) => v === 'true').default('false'),
   REALTIME_URL: z.string().default('http://realtime:4000'),
+  // Mirrors GOTRUE_MULTI_TENANT: when false (default), Realtime tenant
+  // registration is skipped instead of failing. Realtime is not always deployed
+  // (REALTIME_URL may be a dead reference), and JWT rotation must not 502 just
+  // because an unconfigured optional service is unreachable.
+  REALTIME_MULTI_TENANT: z.string().transform((v) => v === 'true').default('false'),
   API_JWT_SECRET: z.string().optional(),
   SUPAVISOR_URL: z.string().default('http://supavisor:4000'),
   SUPAVISOR_API_KEY: z.string().optional(),

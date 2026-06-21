@@ -60,6 +60,12 @@ export function getInstanceSystemPool(conn: InstanceConnectionInfo): pg.Pool {
       connectionTimeoutMillis: 10000,
       ssl: getRdsSslConfig(),
     })
+    // Without an 'error' listener, an idle connection terminated by the
+    // server (Aurora failover / idle timeout / pg_terminate_backend) emits an
+    // 'error' that Node treats as uncaught and crashes the whole process.
+    pool.on('error', (err) => {
+      console.error(`[instance-db ${conn.instanceId}] Unexpected pool error:`, err.message)
+    })
     instancePools.set(conn.instanceId, pool)
   }
   return pool
