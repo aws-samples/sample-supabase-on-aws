@@ -324,7 +324,6 @@ cd tests && ./RUN_TESTS.sh all         # All suites
 | Issue | Symptom | Solution |
 |-------|---------|----------|
 | Missing package-lock.json | tenant-manager build fails: `not found` | Run `npm install` in `app/tenant-manager/` |
-| Missing pnpm-lock.yaml | function-deploy build fails: `lockfile not found` | Run `pnpm install --lockfile-only` in `app/function-deploy/` |
 | ECR Lambda permission | `Lambda does not have permission to access the ECR image` | Run `aws ecr set-repository-policy` (see step 5) |
 | Kong 401 | Unauthorized on REST API calls | Use opaque keys (`sb_publishable_*`), not JWT. Set both `apikey` and `Authorization` headers |
 | DNS NXDOMAIN | Domain not resolving | Check CNAME target, disable Cloudflare proxy, wait for propagation |

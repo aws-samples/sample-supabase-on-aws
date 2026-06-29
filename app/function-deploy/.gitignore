@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
-pnpm-lock.yaml
+# pnpm-lock.yaml is intentionally committed — the Docker build uses
+# `pnpm install --frozen-lockfile` and fails on a clean clone without it.
 package-lock.json
 
 # Build output
