@@ -60,7 +60,11 @@ scan-results/
 
 # Documentation (local only)
 doc/
-docs/
+# docs/ is local-only EXCEPT the published customer upgrade guide. Ignore the
+# directory's contents (not the dir itself, so git can descend) then re-include
+# the one published file.
+docs/*
+!docs/客户升级指南.html
 
 # Exclude tenant-manager and IDE/AI configs
 .cursor/

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Supabase on AWS — Phase 2 升级指南</title>
+<style>
+  :root{
+    --fg:#1a1f29; --muted:#5b6472; --accent:#3ecf8e; --accent-dark:#249a63;
+    --border:#e3e8ef; --code-bg:#1e1e2e; --code-fg:#e4e6eb; --card:#f7f9fc;
+    --warn-bg:#fff8e6; --warn-border:#f0c000; --crit:#e5484d; --crit-bg:#fff0f0;
+    --ok-bg:#eafff3; --blue:#3b82f6; --blue-bg:#eff6ff; --step:#6d54c8;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:#eef1f5;color:var(--fg);line-height:1.7;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,Roboto,sans-serif;}
+  .wrap{max-width:1000px;margin:0 auto;background:#fff;min-height:100vh;box-shadow:0 0 40px rgba(0,0,0,.06);}
+  header{background:linear-gradient(135deg,#1a1f29 0%,#243b55 100%);color:#fff;padding:44px 50px 32px;}
+  header h1{margin:0 0 8px;font-size:27px;font-weight:700;}
+  header .sub{color:#9fb3c8;font-size:14px;}
+  header .meta{margin-top:16px;font-size:12.5px;color:#9fb3c8;}
+  header .meta b{color:var(--accent);}
+  main{padding:12px 50px 64px;}
+  h2{font-size:21px;margin:38px 0 14px;padding-bottom:8px;border-bottom:2px solid var(--accent);}
+  h3{font-size:16px;margin:22px 0 9px;color:var(--accent-dark);}
+  p{margin:10px 0;}
+  code:not(pre code){background:#eef1f5;color:#c0392b;padding:1px 6px;border-radius:4px;font-size:13px;font-family:"SF Mono",Menlo,Consolas,monospace;}
+  pre{background:var(--code-bg);color:var(--code-fg);padding:15px 17px;border-radius:9px;overflow-x:auto;
+    font-size:12.5px;line-height:1.6;font-family:"SF Mono",Menlo,Consolas,monospace;margin:11px 0;}
+  pre .c{color:#7d8590;} pre .k{color:#ff9d6b;} pre .s{color:#a5d6a3;} pre .v{color:#79c0ff;}
+  .toc{background:var(--card);border-radius:10px;padding:16px 24px;margin:20px 0;}
+  .toc a{color:var(--accent-dark);text-decoration:none;margin-right:16px;font-size:13.5px;line-height:2.1;}
+  .toc a:hover{text-decoration:underline;}
+  table{border-collapse:collapse;width:100%;margin:13px 0;font-size:13.5px;}
+  th,td{border:1px solid var(--border);padding:9px 12px;text-align:left;vertical-align:top;}
+  th{background:var(--card);font-weight:600;}
+  tr:nth-child(even) td{background:#fafbfc;}
+  .step{position:relative;margin:24px 0;padding:0 0 0 54px;}
+  .step .num{position:absolute;left:0;top:0;width:38px;height:38px;border-radius:50%;background:var(--step);color:#fff;
+    font-weight:700;font-size:16px;display:flex;align-items:center;justify-content:center;}
+  .step .num::after{content:"";position:absolute;left:50%;top:42px;bottom:-24px;width:2px;background:var(--border);transform:translateX(-50%);}
+  .step:last-child .num::after{display:none;}
+  .step h3{margin:6px 0 9px;color:var(--fg);font-size:16px;}
+  .note{background:var(--blue-bg);border-left:4px solid var(--blue);padding:11px 16px;border-radius:0 8px 8px 0;margin:11px 0;font-size:13.5px;}
+  .important{background:var(--warn-bg);border-left:4px solid var(--warn-border);padding:11px 16px;border-radius:0 8px 8px 0;margin:11px 0;font-size:13.5px;}
+  .caution{background:var(--crit-bg);border-left:4px solid var(--crit);padding:11px 16px;border-radius:0 8px 8px 0;margin:11px 0;font-size:13.5px;}
+  .ok{background:var(--ok-bg);border-left:4px solid var(--accent);padding:11px 16px;border-radius:0 8px 8px 0;margin:11px 0;font-size:13.5px;}
+  .label{font-weight:700;color:var(--accent-dark);}
+  .label-c{font-weight:700;color:var(--crit);}
+  .chk{list-style:none;padding-left:0;} .chk li{margin:7px 0;padding-left:26px;position:relative;}
+  .chk li::before{content:"\2713";position:absolute;left:0;color:var(--accent-dark);font-weight:700;}
+  footer{color:var(--muted);font-size:12px;padding:24px 50px 44px;border-top:1px solid var(--border);}
+  .green{color:var(--accent-dark);font-weight:600;}
+  @media print{body{background:#fff;}.wrap{box-shadow:none;}pre{background:#f4f4f4!important;color:#222!important;}pre span{color:#222!important;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Supabase on AWS — Phase 2 升级指南</h1>
+  <div class="sub">从当前基线版本升级到 Phase 2 · 运维操作手册</div>
+  <div class="meta">适用部署模式:<b>本地构建镜像 + AWS CDK 部署</b> · 升级方式:<b>git pull + cdk deploy(原地升级)</b></div>
+</header>
+<main>
+
+  <div class="toc">
+    <a href="#s1">1. 本次升级概要</a>
+    <a href="#s2">2. 前提条件</a>
+    <a href="#s3">3. 升级前准备</a>
+    <a href="#s4">4. 拉取最新代码</a>
+    <a href="#s5">5. 构建并推送镜像</a>
+    <a href="#s6">6. 部署(CDK)</a>
+    <a href="#s7">7. 刷新服务镜像</a>
+    <a href="#s8">8. 升级后验证</a>
+    <a href="#s9">9. 回滚方案</a>
+    <a href="#s10">10. 故障排查</a>
+    <a href="#mech">11. 升级机制速查(A/B 路径 · 服务名映射)</a>
+    <a href="#feat">12. 二期 6 大修改项:部署 · 使用 · 测试</a>
+  </div>
+
+  <!-- 1 -->
+  <h2 id="s1">1. 本次升级概要</h2>
+  <p>Phase 2 在现有平台基础上<b>新增 Storage 子系统</b>,并增强 Edge Functions、项目生命周期管理与安全性。主要变更:</p>
+  <table>
+    <tr><th>能力</th><th>说明</th></tr>
+    <tr><td><b>Storage(新增)</b></td><td>对象存储服务,多租户隔离。新增一个 S3 桶 + 一个 storage 服务 + 数据库 storage schema。</td></tr>
+    <tr><td>Edge Functions <code>verify_jwt</code></td><td>支持部署时设置免 JWT 校验(webhook 场景),一步部署即可。</td></tr>
+    <tr><td>项目暂停 / 恢复 / 删除</td><td>暂停后数据面真正停止访问,恢复后还原。</td></tr>
+    <tr><td>Secrets 覆盖语义</td><td>同名 secret 覆盖而非堆叠。</td></tr>
+    <tr><td>函数错误分类</td><td>代码错误返回 422(而非误导性 404)。</td></tr>
+    <tr><td>安全加固</td><td>租户隔离、密钥生命周期、依赖 CVE 修复。</td></tr>
+  </table>
+  <div class="ok"><span class="label">对现有数据零影响:</span>升级不修改任何终端用户的表与数据;数据库变更均为新增(加表 / 加 schema),不影响既有读写。存量 API key、Edge Functions 不失效。</div>
+
+  <!-- 2 -->
+  <h2 id="s2">2. 前提条件</h2>
+  <p>执行升级的运维机需具备:</p>
+  <ul class="chk">
+    <li><code>docker</code>(可构建 <code>linux/amd64</code> 镜像)</li>
+    <li><code>node</code>、<code>pnpm</code>、<code>go</code>、<code>deno</code>(各服务构建工具链)</li>
+    <li><code>aws cli</code>(已配置目标账号凭证)</li>
+    <li>AWS CDK(目标账号已完成 <code>cdk bootstrap</code>)</li>
+    <li><code>jq</code>(测试脚本依赖)</li>
+  </ul>
+  <div class="important"><span class="label">配置文件不随代码走:</span><code>config.json</code> 与 <code>certs/</code> 不纳入版本控制(含部署敏感值)。升级过程不会覆盖它们,但请确认其内容为当前环境的有效配置。</div>
+
+  <!-- 3 -->
+  <h2 id="s3">3. 升级前准备</h2>
+  <div class="step"><div class="num">1</div>
+    <h3>备份配置</h3>
+    <pre>cp config.json config.json.bak</pre>
+  </div>
+  <div class="step"><div class="num">2</div>
+    <h3>确认 config.json 含 storage 配置段</h3>
+    <p>Phase 2 引入 Storage,<code>config.json</code> 需包含 <code>storage</code> 段(基线版本没有)。若缺失,请参照配置模板 <code>config.production.json</code> 添加:</p>
+    <pre><span class="k">"storage"</span>: {
+  <span class="k">"bucket"</span>: { <span class="k">"mode"</span>: <span class="s">"create"</span> },   <span class="c">// create=新建桶; 或 "existing"+"name"=引用已有桶</span>
+  <span class="k">"fileSizeLimitBytes"</span>: <span class="v">52428800</span>,      <span class="c">// 单文件上限(50 MiB)</span>
+  <span class="k">"imageTransformationEnabled"</span>: <span class="v">false</span>
+}</pre>
+    <p>校验:<code>cat config.json | jq '.storage'</code></p>
+  </div>
+  <div class="step"><div class="num">3</div>
+    <h3>(建议)消除网关单点中断窗口</h3>
+    <p>若网关服务 <code>kong</code> 的 <code>desiredCount</code> 为 1,升级时其重启会造成数据面短暂中断(数十秒)。建议升级前先将 <code>config.json</code> 中 <code>kong.desiredCount</code> 设为 <b>2</b> 并单独部署一次(选业务低峰),此后网关升级即可零停机。</p>
+  </div>
+
+  <!-- 4 -->
+  <h2 id="s4">4. 拉取最新代码</h2>
+  <p><b>先判断走哪条路径:</b></p>
+  <ul>
+    <li>运维机<b>已有该项目的 git 仓库且工作区干净</b> → 走 <b>方式 A(git pull)</b>。</li>
+    <li>运维机<b>没有仓库,或工作区有未确认的本地改动</b> → 走 <b>方式 B(git clone)</b>。</li>
+    <li>习惯<b>把新版本代码复制成新工程目录、沿用原配置更新现有环境</b> → 走 <b>方式 C</b>。</li>
+  </ul>
+  <p>判断命令:<code>git rev-parse --is-inside-work-tree</code> 与 <code>git status --short</code>。</p>
+  <div class="ok"><span class="label">三种方式的部署结果一致:</span>只要保持栈名、账号/区域、资源物理名不变,A / B / C 都是<b>原地更新同一套环境</b>,后续构建、部署步骤完全相同。区别只在「如何把新代码放到运维机」。</div>
+
+  <h3>方式 A:git pull(增量更新)</h3>
+  <div class="important"><span class="label">先完成以下前置清理,再执行 pull。</span>否则 pull 可能因本地文件冲突而失败。</div>
+  <pre><span class="c"># 前置 1:删除本地未跟踪的 lockfile</span>
+<span class="c">#   早期版本中该文件未纳入版本控制,运维机本地可能存在一份;</span>
+<span class="c">#   新版本已将其纳入 git,若不清理,pull 会报</span>
+<span class="c">#   "untracked working tree files would be overwritten by merge"。</span>
+rm -f app/function-deploy/pnpm-lock.yaml
+
+<span class="c"># 前置 2:检查本地改动(若 status 非空,先暂存)</span>
+git status
+git stash        <span class="c"># 仅当存在需保留的本地改动时</span>
+
+<span class="c"># 前置完成后,拉取最新代码</span>
+git fetch origin
+git pull origin main
+
+<span class="c"># 如之前执行了 stash 且改动仍需要:git stash pop</span></pre>
+
+  <h3>方式 B:git clone(全新检出)</h3>
+  <pre><span class="c"># 1) 全新克隆到新目录</span>
+git clone &lt;repository-url&gt; supabase-app
+cd supabase-app
+git checkout main
+
+<span class="c"># 2) 迁移不随代码走的本地文件(从原运维目录拷入)</span>
+cp &lt;old-dir&gt;/config.json ./config.json
+cp -r &lt;old-dir&gt;/certs ./certs
+
+<span class="c"># 3) 确认 config.json 含 storage 段(见第 3 节步骤 2)</span>
+cat config.json | jq '.storage'</pre>
+
+  <h3>方式 C:复制新工程目录,沿用原配置更新原有环境</h3>
+  <p>若你习惯将新版本代码<b>复制为一个新的工程目录</b>(而非在原目录 pull),再把原环境的配置拷入、重新部署,这样做<b>会原地更新现有的那一套环境</b>(不会新建第二套)。其本质与方式 B 相同,只是用于「更新现有环境」而非「搭建独立环境」。</p>
+  <pre><span class="c"># 1) 准备新版本代码目录(克隆或解压新版本)</span>
+git clone &lt;repository-url&gt; supabase-app-new
+cd supabase-app-new && git checkout main
+
+<span class="c"># 2) 从原环境拷入配置与证书(关键:沿用原配置=更新原环境)</span>
+cp &lt;old-dir&gt;/config.json ./config.json
+cp -r &lt;old-dir&gt;/certs ./certs
+cat config.json | jq '.storage'    <span class="c"># 确认含 storage 段</span></pre>
+  <div class="important"><span class="label">要更新原有环境,必须保持以下三项与原环境完全一致(沿用原配置即满足):</span>
+  <ul style="margin:6px 0;">
+    <li><b>部署栈名 <code>SupabaseStack</code></b>(代码内置,勿改)——部署工具按栈名识别目标,栈名一致才会更新原栈而非新建。</li>
+    <li><b>同一 AWS 账号与区域</b>(<code>config.json</code> 的 <code>project.accountId</code> / <code>project.region</code>)。</li>
+    <li><b>各资源物理名不变</b>:<code>infraStack.cluster.name</code>、<code>loadBalancer.name</code>、<code>studioLoadBalancer.name</code>、<code>workerRds.clusterIdentifier</code>、<code>secrets.prefix</code>、<code>domain.baseDomain</code>。</li>
+  </ul>
+  三项一致 → 后续 <code>cdk deploy SupabaseStack</code> 即对现有环境做<b>增量更新</b>(原地升级),不会产生第二套资源。</div>
+  <div class="caution"><span class="label-c">反向提醒:</span>上述三项中只要任意一项被改动(尤其是<b>栈名</b>或<b>账号/区域</b>),行为就会变化——可能创建出一套全新的并行环境,或因物理资源名冲突而部署失败。要更新原环境,请勿改动它们。</div>
+
+  <!-- 5 -->
+  <h2 id="s5">5. 构建并推送镜像</h2>
+  <p>构建本次升级涉及的服务镜像并推送至 ECR(脚本会自动创建缺失的 ECR 仓库):</p>
+  <pre>./build-and-push.sh storage          <span class="c"># 新增服务</span>
+./build-and-push.sh tenant-manager
+./build-and-push.sh functions
+./build-and-push.sh function-deploy
+./build-and-push.sh kong             <span class="c"># 必须:网关路由配置含 Storage 路由</span>
+./build-and-push.sh auth</pre>
+  <div class="caution"><span class="label-c">务必重新构建 <code>kong</code>:</span>网关的路由配置(<code>kong.yml.tpl</code>)在 Phase 2 中新增了 Storage 路由。若沿用旧网关镜像,Storage 数据面请求将返回 <code>404 no Route matched</code>。</div>
+  <div class="note"><span class="label">确认需重建的服务:</span>执行 <code>git diff &lt;基线版本&gt; HEAD --name-only | grep '^app/'</code>,凡 <code>app/</code> 下有代码变更的服务都需重新构建。本次为 storage、tenant-manager、functions、function-deploy、kong、auth。</div>
+  <div class="note"><span class="label">构建提示:</span>auth 服务(Go)若构建时拉取依赖超时,其 Dockerfile 已配置国内代理;function-deploy 的 lockfile 已纳入版本控制,干净检出即可构建。</div>
+
+  <!-- 6 -->
+  <h2 id="s6">6. 部署(CDK)</h2>
+  <div class="step"><div class="num">1</div>
+    <h3>编译并审查变更</h3>
+    <pre>cd infra && npm run build
+cdk diff SupabaseStack</pre>
+    <p>预期变更:新增 S3 桶、新增 storage 服务、若干任务定义(TaskDefinition)更新。<b>确认变更中不包含数据库集群、S3 桶、缓存等有状态资源的「替换(replace)」</b>——正常升级只更新任务定义,不应替换有状态资源。</p>
+    <div class="caution"><span class="label-c">版本兼容:</span>请确保 CDK CLI 版本与项目依赖的 <code>aws-cdk-lib</code> 版本兼容。若提示 <code>Cloud assembly schema version mismatch</code>,需升级 CDK CLI 或锁定 <code>aws-cdk-lib</code> 至匹配版本。</div>
+  </div>
+  <div class="step"><div class="num">2</div>
+    <h3>执行部署</h3>
+    <pre>cdk deploy SupabaseStack --require-approval never</pre>
+    <p>该步骤新建 S3 桶与 storage 服务,并更新任务定义。部署过程中关注各服务的滚动状态。</p>
+    <div class="important"><span class="label">无自动回滚:</span>部署未启用熔断器,异常镜像不会自动回滚。请关注部署状态直至 <code>COMPLETED</code>:
+    <pre>aws ecs describe-services --cluster &lt;cluster-name&gt; \
+  --services storage-api kong-gateway tenant-manager \
+  --region &lt;region&gt; \
+  --query 'services[*].[serviceName,deployments[0].rolloutState]'</pre></div>
+  </div>
+
+  <!-- 7 -->
+  <h2 id="s7">7. 刷新服务镜像(关键步骤)</h2>
+  <div class="caution"><span class="label-c">必做,不可省略:</span>CDK 通过 <code>:latest</code> 标签引用镜像。<code>cdk deploy</code> <b>仅在任务定义结构发生变化时</b>才会触发服务拉取新镜像。对于代码已更新、但任务定义未变化的服务,<code>cdk deploy</code> <b>不会</b>使其拉取新镜像,服务将继续运行旧版本代码。</div>
+  <p>因此,部署完成后,需对<b>所有重新构建过镜像的服务</b>强制刷新一次:</p>
+  <pre>for svc in kong-gateway tenant-manager functions-service \
+           function-deploy auth-service storage-api; do
+  aws ecs update-service --cluster &lt;cluster-name&gt; \
+    --service "$svc" --force-new-deployment --region &lt;region&gt; \
+    --query 'service.deployments[0].rolloutState' --output text
+done</pre>
+  <div class="note"><span class="label">服务名说明:</span>ECS 服务名与 ECR 仓库名可能不同(如仓库 <code>functions-service</code> / <code>kong-configured</code> 对应服务 <code>functions-service</code> / <code>kong-gateway</code>)。可用 <code>aws ecs list-services --cluster &lt;cluster-name&gt;</code> 查询实际服务名。</div>
+  <div class="note"><span class="label">数据库迁移(自动):</span>平台数据库与各租户数据库的 schema 变更在对应服务启动时自动执行,均为新增操作,无需手动干预,也无需回滚。</div>
+
+  <!-- 8 -->
+  <h2 id="s8">8. 升级后验证</h2>
+  <p>项目内置测试套件可自动从 CloudFormation 输出与 <code>config.json</code> 探测配置。在 <code>tests/</code> 目录执行:</p>
+  <pre>cd tests
+
+<span class="c"># Phase 2 新增能力</span>
+./RUN_TESTS.sh storage                          <span class="c"># Storage</span>
+PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh verify-jwt     <span class="c"># Edge Function verify_jwt</span>
+./RUN_TESTS.sh lifecycle                        <span class="c"># 暂停/恢复/删除</span>
+PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh secrets        <span class="c"># Secrets 覆盖</span>
+PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh fn-errors      <span class="c"># 函数错误分类</span>
+
+<span class="c"># 既有功能回归</span>
+./RUN_TESTS.sh isolation                        <span class="c"># 租户隔离</span>
+./RUN_TESTS.sh functions                        <span class="c"># Edge Functions 生命周期</span>
+./RUN_TESTS.sh studio
+./RUN_TESTS.sh auth</pre>
+  <div class="ok"><span class="label">通过标准:</span>各套件全部用例 PASSED(verify-jwt 含 1 个环境相关的 skip 属正常)。若 storage 报 404、或函数错误分类返回旧格式,通常是<b>第 7 节的镜像刷新未执行</b>(见第 10 节)。</div>
+
+  <!-- 9 -->
+  <h2 id="s9">9. 回滚方案</h2>
+  <table>
+    <tr><th>问题</th><th>回滚方式</th></tr>
+    <tr><td>镜像异常(服务无法启动)</td><td>将服务镜像标签回退至上一版本(ECR 保留历史镜像),或回退代码后重新 <code>cdk deploy</code>。</td></tr>
+    <tr><td>CDK 栈变更</td><td>检出基线版本代码,执行 <code>cdk deploy</code> 回退(本次升级无破坏性资源变更,可逆)。</td></tr>
+    <tr><td>数据库迁移</td><td><b>无需回滚</b>——均为新增(加表/加 schema),不影响旧代码。</td></tr>
+  </table>
+  <div class="important"><span class="label">回滚前提:</span>升级前请记录当前各服务镜像标签与代码版本(<code>git rev-parse HEAD</code>),以便必要时回退。</div>
+
+  <!-- 10 -->
+  <h2 id="s10">10. 故障排查</h2>
+  <table>
+    <tr><th>现象</th><th>原因</th><th>处理</th></tr>
+    <tr><td>git pull 报 untracked files would be overwritten</td><td>本地存在未跟踪的 pnpm-lock.yaml</td><td>执行第 4 节前置 1:<code>rm -f app/function-deploy/pnpm-lock.yaml</code></td></tr>
+    <tr><td>构建项目失败,提示找不到 lockfile / package-lock</td><td>依赖锁文件缺失</td><td>在对应服务目录执行 <code>pnpm install --lockfile-only</code> 或 <code>npm install</code> 生成后再构建</td></tr>
+    <tr><td>cdk diff 提示 schema version mismatch</td><td>CDK CLI 与 aws-cdk-lib 版本不兼容</td><td>升级 CDK CLI,或锁定 aws-cdk-lib 至兼容版本</td></tr>
+    <tr><td class="label-c">Storage 请求 404 "no Route matched"</td><td>网关 kong 未重新构建/刷新,缺 Storage 路由</td><td>重新构建 kong 镜像(第 5 节)+ 强制刷新 kong 服务(第 7 节)</td></tr>
+    <tr><td class="label-c">函数错误返回旧格式(404 而非 422)、或服务行为仍是旧版</td><td>cdk deploy 未触发该服务拉取新镜像</td><td>对该服务执行 <code>force-new-deployment</code>(第 7 节)</td></tr>
+    <tr><td>创建项目报 No database instances registered</td><td>数据库实例未注册到平台(多见于全新部署)</td><td>执行 <code>./scripts/provision-worker-and-create-project.sh</code> 注册</td></tr>
+    <tr><td>数据面域名无法访问(全新部署/更换负载均衡器后)</td><td>通配子域名 DNS 未指向当前网关 ALB</td><td>将 <code>*.&lt;your-domain&gt;</code> 的 CNAME 指向 CFN 输出 <code>ALBDnsName</code> 对应的网关 ALB,等待 DNS 生效</td></tr>
+  </table>
+
+  <!-- 11 升级机制速查 -->
+  <h2 id="mech">11. 升级机制速查(A/B 路径 · 服务名映射)</h2>
+  <p>升级时如何让改动生效,取决于<b>你改了什么</b>。选错路径是「改了却没生效」最常见的原因。</p>
+
+  <h3>路径 A:服务代码变更(Docker 镜像)</h3>
+  <p>改动 <code>app/*</code> 下任何服务(Kong 配置、GoTrue、tenant-manager、Studio 等)都需重建镜像并强制 ECS 拉取。<b><code>cdk deploy</code> 在镜像 tag 不变时不会拉新镜像</b>——任务定义仍指向 <code>:latest</code>,ECS 保持旧任务运行。必须强制刷新:</p>
+  <pre><span class="c"># 1. 重建并推送(同时推 :latest 与 :&lt;git-sha&gt;)</span>
+./build-and-push.sh &lt;service&gt;      <span class="c"># 如 kong、auth、tenant-manager</span>
+<span class="c"># 2. 强制 ECS 拉取新 :latest 并替换运行任务</span>
+aws ecs update-service --cluster &lt;cluster&gt; --service &lt;service-name&gt; --force-new-deployment --region &lt;region&gt;
+<span class="c"># 3. 等待滚动稳定</span>
+aws ecs wait services-stable --cluster &lt;cluster&gt; --services &lt;service-name&gt; --region &lt;region&gt;</pre>
+  <p>ECR 仓库名与 ECS 服务名对部分服务不同:</p>
+  <table>
+    <tr><th><code>build-and-push.sh</code> 参数</th><th>ECS 服务名</th></tr>
+    <tr><td><code>kong</code></td><td><code>kong-gateway</code></td></tr>
+    <tr><td><code>auth</code></td><td><code>auth-service</code></td></tr>
+    <tr><td><code>functions</code></td><td><code>functions-service</code></td></tr>
+    <tr><td><code>storage</code></td><td><code>storage-api</code></td></tr>
+    <tr><td><code>tenant-manager</code> / <code>studio</code> / <code>function-deploy</code> / <code>postgres-meta</code></td><td>同名</td></tr>
+  </table>
+
+  <h3>路径 B:基础设施变更(CDK)</h3>
+  <p>改动 <code>infra/</code>(VPC、RDS、ECS 任务定义、ALB、IAM、env 等)走 CDK。任务定义变更(新 env、CPU/内存等)<b>会</b>自动滚动服务:</p>
+  <pre>cd infra &amp;&amp; npm run build &amp;&amp; npx cdk diff SupabaseStack   <span class="c"># 预览</span>
+npx cdk deploy SupabaseStack --require-approval never</pre>
+  <div class="note"><span class="label">经验法则:</span>镜像内容变 → 路径 A(<code>force-new-deployment</code>);任务/基础设施定义变 → 路径 B(<code>cdk deploy</code>)。若两者都改了(如新镜像 + 它要读的新 env),先 B 再 A。</div>
+
+  <h3>Kong 说明(DB-backed 声明式配置)</h3>
+  <p>Kong 以 DB-backed 模式运行,启动时经 <code>kong config db_import</code> 导入 <code>kong.yml.tpl</code>,这是<b>增量 upsert——从不删除</b>配置里已移除的实体。入口脚本在每次启动时跑一个幂等自愈(<code>heal-stale-plugins.lua</code>),清掉旧配置遗留的 service 级鉴权插件。因此对 <code>kong-gateway</code> 直接重建 + <code>force-new-deployment</code> 即可,无需手动清理 DB。</p>
+
+  <!-- 12 -->
+  <h2 id="feat">12. 二期 6 大修改项:部署 · 使用 · 测试</h2>
+  <p>本节按二期需求的 6 个修改项逐一说明:<b>涉及哪些服务(部署)、接口怎么用(使用)、如何验证(测试)</b>。前 1-10 节是通用升级流程;本节是各能力的细化。下表中 <code>&lt;ref&gt;</code> 为项目 ID,<code>&lt;domain&gt;</code> 为基础域名,<code>&lt;studio-alb&gt;</code> 为 Studio ALB 域名,<code>&lt;admin-key&gt;</code> 为管理密钥(Secrets Manager <code>supabase/admin-api-key</code>)。</p>
+  <table>
+    <tr><th>#</th><th>修改项</th><th>需重建的服务</th><th>测试套件</th></tr>
+    <tr><td>1</td><td>Storage 对象存储</td><td>storage、kong</td><td><code>./RUN_TESTS.sh storage</code></td></tr>
+    <tr><td>2</td><td>Function <code>verify_jwt</code></td><td>function-deploy、functions</td><td><code>./RUN_TESTS.sh verify-jwt</code></td></tr>
+    <tr><td>3</td><td>项目暂停 / 恢复 / 删除</td><td>tenant-manager</td><td><code>./RUN_TESTS.sh lifecycle</code></td></tr>
+    <tr><td>4</td><td>Secrets 覆盖语义</td><td>function-deploy(studio)</td><td><code>./RUN_TESTS.sh secrets</code></td></tr>
+    <tr><td>5</td><td>登录增强(Google OAuth 等)</td><td>auth、tenant-manager、kong、function-deploy</td><td><code>./RUN_TESTS.sh oauth</code></td></tr>
+    <tr><td>6</td><td>函数错误分类(404→422)</td><td>function-deploy</td><td><code>./RUN_TESTS.sh fn-errors</code></td></tr>
+  </table>
+
+  <!-- ===== 11.1 Storage ===== -->
+  <h3>11.1 Storage 对象存储(新增)</h3>
+  <p><b>部署</b>:新增 S3 桶 + storage 服务 + 数据库 storage schema。<code>config.json</code> 的 <code>storage.bucket.mode</code> 决定桶来源:<code>create</code>=CDK 新建并托管;<code>existing</code>+<code>name</code>=引用已有桶(CDK 只授权、不创建/删除)。需重建 <b>storage</b> 与 <b>kong</b>(网关含 Storage 路由)。</p>
+  <pre><span class="c"># config.json</span>
+<span class="k">"storage"</span>: { <span class="k">"bucket"</span>: { <span class="k">"mode"</span>: <span class="s">"create"</span> }, <span class="k">"fileSizeLimitBytes"</span>: <span class="v">52428800</span>, <span class="k">"imageTransformationEnabled"</span>: <span class="v">false</span> }
+<span class="c"># 构建 + 刷新</span>
+./build-and-push.sh storage && ./build-and-push.sh kong
+aws ecs update-service --cluster &lt;cluster&gt; --service storage-api --force-new-deployment --region &lt;region&gt;</pre>
+  <p><b>使用</b>:所有 Storage 请求统一经项目子域走 Kong 网关(Kong 用 key-auth 校验 opaque apikey、注入 <code>X-Project-ID</code>、铸造 5 分钟短期 JWT 给 storage-api;storage-api 据此做多租户隔离)。基址 <code>https://&lt;ref&gt;.&lt;domain&gt;/storage/v1</code>,请求头统一带 <code>apikey: &lt;key&gt;</code>(anon 或 service_role opaque key)。</p>
+
+  <p>完整 API 速查(本次新增的对象存储数据面;路径均经源码 <code>app/storage/src/http/routes/</code> 核对,前缀 <code>/storage/v1</code>。fastify 通配段 <code>*</code> 即对象 path):</p>
+  <table>
+    <tr><th>能力</th><th>方法 + 路径(<code>/storage/v1</code> 前缀下)</th><th>说明 / body</th></tr>
+    <tr><td>创建桶</td><td><code>POST /bucket</code></td><td>body <code>{"id","name","public","file_size_limit","allowed_mime_types"}</code></td></tr>
+    <tr><td>列出桶</td><td><code>GET /bucket</code></td><td>当前租户的全部桶</td></tr>
+    <tr><td>取单桶 / 改桶</td><td><code>GET /bucket/{id}</code> · <code>PUT /bucket/{id}</code></td><td>改 public / 大小 / mime 限制</td></tr>
+    <tr><td>清空桶 / 删桶</td><td><code>POST /bucket/{id}/empty</code> · <code>DELETE /bucket/{id}</code></td><td>删桶要求先清空</td></tr>
+    <tr><td>上传对象</td><td><code>POST /object/{bucket}/*</code></td><td>二进制 body + <code>Content-Type</code>;覆盖上传用 <code>PUT /object/{bucket}/*</code></td></tr>
+    <tr><td>下载(鉴权)</td><td><code>GET /object/authenticated/{bucket}/*</code></td><td>私有桶按 RLS 取(标准路径)</td></tr>
+    <tr><td>下载(公开桶)</td><td><code>GET /object/public/{bucket}/*</code></td><td>public 桶免鉴权读</td></tr>
+    <tr><td>对象元信息</td><td><code>GET /object/info/authenticated/{bucket}/*</code></td><td>取 metadata;公开桶版 <code>/object/info/public/{bucket}/*</code></td></tr>
+    <tr><td>复制</td><td><code>POST /object/copy</code></td><td>body <code>{"bucketId","sourceKey","destinationKey"}</code></td></tr>
+    <tr><td>移动</td><td><code>POST /object/move</code></td><td>body <code>{"bucketId","sourceKey","destinationKey"}</code></td></tr>
+    <tr><td>删除单个</td><td><code>DELETE /object/{bucket}/*</code></td><td>路径含对象 key</td></tr>
+    <tr><td>批量删除</td><td><code>DELETE /object/{bucket}</code></td><td>末尾无 <code>/*</code>;body <code>{"prefixes":["a.png","b.png"]}</code></td></tr>
+    <tr><td>列对象 V1</td><td><code>POST /object/list/{bucket}</code></td><td>body <code>{"prefix","limit","offset"}</code></td></tr>
+    <tr><td>列对象 V2</td><td><code>POST /object/list-v2/{bucket}</code></td><td>连字符 <code>list-v2</code>;游标分页 <code>cursor</code></td></tr>
+    <tr><td>签名下载 URL(单个)</td><td><code>POST /object/sign/{bucket}/*</code></td><td>body <code>{"expiresIn":60}</code> → 返回 <code>signedURL</code></td></tr>
+    <tr><td>签名下载 URL(批量)</td><td><code>POST /object/sign/{bucket}</code></td><td>末尾无 <code>/*</code>;body <code>{"paths":[...],"expiresIn":60}</code></td></tr>
+    <tr><td>用签名 token 下载</td><td><code>GET /object/sign/{bucket}/*?token=...</code></td><td>免鉴权,凭签名 token</td></tr>
+    <tr><td>签名上传 URL</td><td><code>POST /object/upload/sign/{bucket}/*</code></td><td>注意是 <code>upload/sign</code>;签发后用 <code>PUT /object/upload/sign/{bucket}/*</code> 上传</td></tr>
+  </table>
+  <pre><span class="c"># 端到端示例:建桶 → 上传 → 下载 → 签名 URL → 删除</span>
+B=https://&lt;ref&gt;.&lt;domain&gt;/storage/v1 ; H="apikey: &lt;key&gt;"
+curl -X POST "$B/bucket"  -H "$H" -H "Content-Type: application/json" -d '{"id":"my-bucket","name":"my-bucket","public":false}'
+curl -X POST "$B/object/my-bucket/hello.txt" -H "$H" -H "Content-Type: text/plain" --data-binary @hello.txt
+curl       "$B/object/authenticated/my-bucket/hello.txt" -H "$H"            <span class="c"># 下载往返</span>
+curl -X POST "$B/object/sign/my-bucket/hello.txt" -H "$H" -d '{"expiresIn":60}'   <span class="c"># → {"signedURL":"/object/sign/..."}</span>
+curl -X DELETE "$B/object/my-bucket/hello.txt" -H "$H"</pre>
+  <div class="note"><span class="label">官方 supabase-js 同样可用:</span><code>createClient(url, key).storage.from('my-bucket').upload(...)/download(...)/createSignedUrl(...)</code>,SDK 内部即调用上表端点。</div>
+
+  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh storage</code> —— S0 租户注册、S1-S2 桶 CRUD、S3-S4 对象上传/下载往返、S5 签名 URL、S6-S7 删除清理,共 8 项。</p>
+  <div class="caution"><span class="label-c">务必重建 kong:</span>若沿用旧网关镜像,Storage 请求返回 <code>404 no Route matched</code>。</div>
+
+  <!-- ===== 11.2 verify_jwt ===== -->
+  <h3>11.2 Function <code>verify_jwt</code> 参数(webhook 场景)</h3>
+  <p><b>部署</b>:重建 <b>function-deploy</b>(部署链路持久化 verify_jwt)与 <b>functions</b>(运行时按真实 verify_jwt 拦截)。无新增基础设施。</p>
+  <p><b>使用</b>:部署函数时在 <code>metadata</code> 一步带上 <code>verify_jwt</code>(无需再单独 PATCH)。<code>verify_jwt:false</code> 时该函数允许无 JWT 匿名访问(供 Stripe / GitHub 等 webhook 回调)。</p>
+  <pre><span class="c"># 部署一个 webhook 函数(免 JWT 校验)</span>
+<span class="c"># multipart 部署请求的 metadata 字段(字段名经 deploy.ts 核对):</span>
+{ <span class="k">"verify_jwt"</span>: <span class="v">false</span>, <span class="k">"entrypoint_path"</span>: <span class="s">"index.ts"</span> }</pre>
+  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh verify-jwt</code> —— V1 内部查找默认 true、V2 部署即持久化、V3 <code>true</code> 拒匿名、V4 <code>false</code> 放行匿名(webhook)、V5 带 apikey 仍可用、V6 切回再次强制,共 6 项(含 1 个环境相关 skip)。</p>
+
+  <!-- ===== 11.3 lifecycle ===== -->
+  <h3>11.3 项目暂停 / 恢复 / 删除</h3>
+  <p><b>部署</b>:重建 <b>tenant-manager</b>。语义:手动调服务端接口,暂停后数据面<b>真正停止</b>访问(平台库 status 离开 active,Kong 网关 gate 拦截),恢复后还原;非自动。</p>
+  <p><b>使用</b>(管理接口,需 admin key):</p>
+  <pre>curl -X POST "https://&lt;studio-alb&gt;/admin/v1/projects/&lt;ref&gt;/pause"   -H "Authorization: Bearer &lt;admin-key&gt;"
+curl -X POST "https://&lt;studio-alb&gt;/admin/v1/projects/&lt;ref&gt;/resume"  -H "Authorization: Bearer &lt;admin-key&gt;"   <span class="c"># /restore 为等价别名</span>
+curl -X DELETE "https://&lt;studio-alb&gt;/admin/v1/projects/&lt;ref&gt;"       -H "Authorization: Bearer &lt;admin-key&gt;"</pre>
+  <p><b>测试</b>:<code>./RUN_TESTS.sh lifecycle</code> —— K0 建项目、K1 暂停→PAUSED、K2 <code>/resume</code> 恢复→ACTIVE_HEALTHY、K3 <code>/resume</code>==<code>/restore</code> 别名、K4 恢复后 REST/JS SDK 可达、K5 删除拆除、K6 同 ref 重建(201 或 409 守卫),共 7 项。</p>
+  <div class="note"><span class="label">暂停的数据面停止机制:</span>靠 Kong 缓存 TTL(默认 300s)自然失效。暂停后已缓存的项目最多 1 个 TTL 后被拦截;新项目立即生效。</div>
+
+  <!-- ===== 11.4 secrets ===== -->
+  <h3>11.4 Secrets 覆盖语义</h3>
+  <p><b>部署</b>:重建 <b>function-deploy</b>(Studio)。修复点:同名 secret 应<b>替代</b>而非堆叠;系统默认的明文 secret(如 <code>SUPABASE_ANON_KEY</code> / <code>SUPABASE_SERVICE_ROLE_KEY</code>)被用户覆盖后,旧明文不再残留。</p>
+  <p><b>使用</b>(经 Studio ALB,由 function-deploy 的 studio 实现;方法 <code>GET/POST/DELETE</code>,源码 <code>app/function-deploy/apps/studio/pages/api/v1/projects/[ref]/secrets.ts</code>):</p>
+  <table>
+    <tr><th>方法 + 路径</th><th>body</th><th>说明</th></tr>
+    <tr><td><code>GET /api/v1/projects/{ref}/secrets</code></td><td>—</td><td>返回明文数组 <code>[{name,value,updated_at}]</code></td></tr>
+    <tr><td><code>POST /api/v1/projects/{ref}/secrets</code></td><td>裸数组 <code>[{"name","value"}]</code></td><td>同名覆盖、不堆叠(201)</td></tr>
+    <tr><td><code>DELETE /api/v1/projects/{ref}/secrets</code></td><td>字符串数组 <code>["NAME1","NAME2"]</code></td><td>删用户 secret;系统名删后回落默认值</td></tr>
+  </table>
+  <pre>curl "https://&lt;studio-alb&gt;/api/v1/projects/&lt;ref&gt;/secrets" -H "Authorization: Bearer &lt;admin-key&gt;"                <span class="c"># GET</span>
+curl -X POST   "https://&lt;studio-alb&gt;/api/v1/projects/&lt;ref&gt;/secrets" -H "Authorization: Bearer &lt;admin-key&gt;" \
+  -H "Content-Type: application/json" -d '[{"name":"MY_KEY","value":"my-value"}]'                            <span class="c"># POST 覆盖/新增</span>
+curl -X DELETE "https://&lt;studio-alb&gt;/api/v1/projects/&lt;ref&gt;/secrets" -H "Authorization: Bearer &lt;admin-key&gt;" \
+  -H "Content-Type: application/json" -d '["MY_KEY"]'                                                         <span class="c"># DELETE</span></pre>
+  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh secrets</code> —— G 默认 4 个系统 secret + 明文、H 覆盖语义(同名替代不重复)、I 删除语义(系统名回落默认值、用户 secret 真正删除)。</p>
+
+  <!-- ===== 11.5 login ===== -->
+  <h3>11.5 登录增强(Google OAuth / 邮箱改密 / 后台改密)</h3>
+  <p><b>部署</b>:涉及 <b>4 个服务</b>,按依赖顺序滚动:<b>tenant-manager → auth → kong → function-deploy</b>。tenant-manager 先(建平台库 OAuth provider 表、产出 GoTrue 消费的 <code>external</code> 字段);kong 放行无法携带 apikey 的 OAuth/SAML 回调端点。<b>无新增 env/secret</b>:Google 凭据按租户在运行期录入,client_secret 用既有 <code>ENCRYPTION_KEY</code> 加密入库。</p>
+  <pre>for svc in tenant-manager auth function-deploy; do ./build-and-push.sh $svc; done
+./build-and-push.sh kong
+for svc in tenant-manager auth-service kong-gateway function-deploy; do
+  aws ecs update-service --cluster &lt;cluster&gt; --service $svc --force-new-deployment --region &lt;region&gt;
+done</pre>
+  <p><b>使用</b>:登录增强分两层 —— 管理面(tenant-manager,配 provider,需 admin key)与数据面(GoTrue <code>/auth/v1/*</code>,经 Kong,带项目 apikey)。</p>
+
+  <p>① <b>管理面:per-tenant Google provider 配置</b>(tenant-manager,经 Studio ALB):</p>
+  <table>
+    <tr><th>方法 + 路径</th><th>说明</th></tr>
+    <tr><td><code>PUT /admin/v1/projects/{ref}/auth/external/google</code></td><td>upsert;body <code>{"enabled","client_id","client_secret","redirect_uri","skip_nonce_check"}</code>。secret 加密入库</td></tr>
+    <tr><td><code>GET /admin/v1/projects/{ref}/auth/external/google</code></td><td>读取;<b>secret 不回显</b>,仅返回 <code>secret_set:true</code></td></tr>
+    <tr><td><code>DELETE /admin/v1/projects/{ref}/auth/external/google</code></td><td>移除该项目的 Google provider</td></tr>
+  </table>
+  <pre>curl -X PUT "https://&lt;studio-alb&gt;/admin/v1/projects/&lt;ref&gt;/auth/external/google" -H "Authorization: Bearer &lt;admin-key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":true,"client_id":"&lt;gid&gt;.apps.googleusercontent.com","client_secret":"&lt;secret&gt;","redirect_uri":"https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/callback"}'</pre>
+
+  <p>② <b>数据面:GoTrue 认证端点</b>(基址 <code>https://&lt;ref&gt;.&lt;domain&gt;/auth/v1</code>,带 <code>apikey: &lt;anon-key&gt;</code>;<code>/callback</code> 等回调端点由 Kong 放行、无需 apikey。路径经源码 <code>app/supabase-auth/internal/api/api.go</code> 核对):</p>
+  <table>
+    <tr><th>需求</th><th>方法 + 路径</th><th>body / 说明</th></tr>
+    <tr><td>5a 发起 Google 登录</td><td><code>GET /authorize?provider=google</code></td><td>302 重定向到 Google,带本租户 client_id</td></tr>
+    <tr><td>5a OAuth 回调</td><td><code>GET /callback</code> 与 <code>POST /callback</code></td><td>Google 重定向回此(免 apikey),换 token 建 session</td></tr>
+    <tr><td>5a 读取 provider 状态</td><td><code>GET /settings</code></td><td>返回 <code>external.google</code> 是否启用</td></tr>
+    <tr><td>5b 邮箱发重置码</td><td><code>POST /recover</code></td><td>body <code>{"email":"..."}</code>(<b>无 type 字段</b>)→ 发重置邮件</td></tr>
+    <tr><td>5b 校验并改密</td><td><code>POST /verify</code>(亦有 <code>GET /verify</code>)</td><td>body <code>{"type":"recovery","email":"...","token":"&lt;code&gt;"}</code>(或 <code>token_hash</code>)</td></tr>
+    <tr><td>5b OTP(可选)</td><td><code>POST /otp</code></td><td>body <code>{"email":"..."}</code> 发一次性码</td></tr>
+    <tr><td>5c 后台改用户密码</td><td>经 Studio 后台 <code>PATCH /api/platform/auth/{ref}/users/{id}</code></td><td>由 Studio 内部用 service 凭证调 GoTrue;<b>不要</b>客户直接打 GoTrue admin(见下方注意)</td></tr>
+  </table>
+  <pre><span class="c"># 5a 发起 Google 登录(浏览器跳转或 supabase-js signInWithOAuth)</span>
+GET https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/authorize?provider=google      <span class="c"># 带 apikey</span>
+
+<span class="c"># 5b 邮箱发重置码(recover body 仅含 email,无 type)</span>
+curl -X POST "https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/recover" -H "apikey: &lt;anon-key&gt;" \
+  -H "Content-Type: application/json" -d '{"email":"user@example.com"}'
+<span class="c"># 用户收到验证码后,verify 带 type=recovery 完成改密</span>
+curl -X POST "https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/verify"  -H "apikey: &lt;anon-key&gt;" \
+  -H "Content-Type: application/json" -d '{"type":"recovery","email":"user@example.com","token":"&lt;code&gt;"}'
+
+<span class="c"># 5c 后台修改某用户密码 —— 经 Studio 后台 API(Studio 内部持 service 凭证)</span>
+curl -X PATCH "https://&lt;studio-alb&gt;/api/platform/auth/&lt;ref&gt;/users/&lt;user_id&gt;" \
+  -H "Content-Type: application/json" -d '{"password":"NewPassw0rd!"}'</pre>
+  <div class="caution"><span class="label-c">5c 实测要点(经真实环境验证):</span>GoTrue 的 <code>/auth/v1/admin/*</code> 端点要求 service_role/supabase_admin <b>角色的 JWT</b>;而本平台 Kong 的 <code>/auth/v1</code> 路径<b>只透传 opaque key、不铸造 JWT</b>。因此客户直接用 <code>sb_secret_</code> opaque key 打 <code>/auth/v1/admin/users/{id}</code> 会返回 <code>403 bad_jwt</code>(实测)。后台改密应经 <b>Studio 后台</b>(由 Studio 用内部 <code>SUPABASE_SERVICE_KEY</code> 调 <code>auth.admin.updateUserById()</code>)。</div>
+  <div class="note"><span class="label">supabase-js 等价:</span><code>signInWithOAuth({provider:'google'})</code>(5a)、<code>resetPasswordForEmail(email)</code>+<code>verifyOtp({type:'recovery',...})</code>(5b)。5c 在持有 service_role JWT 的服务端可用 <code>auth.admin.updateUserById(id,{password})</code>。</div>
+  <div class="note"><span class="label">管理面 PUT provider 的 body:</span><code>enabled</code> 必填;当 <code>enabled=true</code> 时 <code>client_id</code> / <code>client_secret</code> / <code>redirect_uri</code> 三者必填;<code>skip_nonce_check</code> 可选(默认 false)。GET 读取时<b>不返回 client_secret</b>,仅返回 <code>secret_set: true/false</code>。</div>
+  <p>需在 Google Cloud Console 把 <code>https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/callback</code> 加入授权回调 URL。</p>
+  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh oauth</code> —— O0 取 anon key、O1 provider CRUD(加密+掩码)、O2 GoTrue <code>/settings</code> 反映租户 google、O3 Kong 放行 OAuth/SAML 端点、O4 受保护端点仍 key-auth、O5 <code>/authorize</code> 重定向到 Google 带租户 client_id。</p>
+  <div class="caution"><span class="label-c">已知问题(跟踪中):</span>从模板库 <code>supabase_template</code> 克隆出的租户库,其 <code>auth.flow_state</code> 表缺少本次新增的 OAuth 上下文列(<code>CREATE TABLE IF NOT EXISTS</code> 对已存在表是 no-op)。在<b>刷新模板库 + 回填现有租户</b>(<code>ALTER TABLE … ADD COLUMN IF NOT EXISTS</code>)之前,<code>/authorize?provider=google</code> 会返回 500(<code>Error creating flow state</code>)。oauth 套件的 O5 已据此标记为 <code>xfail</code>;修复后改为硬断言。</div>
+
+  <!-- ===== 11.6 function error classification ===== -->
+  <h3>11.6 函数部署错误分类(404 → 422)</h3>
+  <p><b>部署</b>:重建 <b>function-deploy</b>。修复点:函数<b>代码语法错误</b>导致部署失败时,旧版误返 <code>404 Function not found</code>(让用户以为是功能缺陷);新版区分错误类型——代码错误返 <code>422 FUNCTION_VALIDATION_FAILED</code>,函数确实不存在才返 <code>404 FUNCTION_NOT_FOUND</code>。</p>
+  <p><b>使用</b>:正常部署/调用即可;错误响应体携带明确 error code,便于客户自查。</p>
+  <p><b>测试</b>:<code>./RUN_TESTS.sh fn-errors</code> —— E1 坏代码部署即拒(422 FUNCTION_VALIDATION_FAILED)、E2 合法代码部署成功(201)、E3 缺失函数→404 FUNCTION_NOT_FOUND、E4 合法函数实际可运行,共 4 项。</p>
+
+  <div class="ok"><span class="label">一次性跑全部:</span><code>cd tests && pip install -r requirements.txt &amp;&amp; ./RUN_TESTS.sh all</code> 覆盖以上 6 项 + 既有功能回归。除 11.5 的 O5(xfail)与少量环境相关 skip 外,应全部 PASSED。</div>
+
+</main>
+<footer>
+  Supabase on AWS · Phase 2 升级指南 · 运维交付文档<br>
+  环境相关参数(域名、账号、区域、集群名)以 <code>&lt;占位符&gt;</code> 表示,执行时替换为实际值。
+</footer>
+</div>
+</body>
+</html>
