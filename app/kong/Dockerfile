@@ -28,6 +28,11 @@ COPY kong.yml.tpl /tmp/kong.yml.tpl
 COPY docker-entrypoint-custom.sh /docker-entrypoint-custom.sh
 RUN chmod +x /docker-entrypoint-custom.sh
 
+# Idempotent post-start self-heal: removes stale SERVICE-level auth plugins
+# left on auth-service by db_import upserts (run via resty from the entrypoint)
+COPY heal-stale-plugins.lua /heal-stale-plugins.lua
+RUN chmod 0644 /heal-stale-plugins.lua
+
 # Environment variables
 # KONG_DATABASE, KONG_PG_HOST, KONG_PG_USER, KONG_PG_PASSWORD, KONG_PG_DATABASE
 # are injected by ECS task definition via CDK
