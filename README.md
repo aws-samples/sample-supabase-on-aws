@@ -303,6 +303,50 @@ npx cdk deploy SupabaseStack --require-approval never
 
 Kong runs DB-backed and imports `kong.yml.tpl` on startup via `kong config db_import`, which is an **incremental upsert — it never deletes** entities removed from the config. The entrypoint runs an idempotent self-heal (`heal-stale-plugins.lua`) on each start to drop stale service-level auth plugins left behind by older configs, so a plain rebuild + `force-new-deployment` of `kong-gateway` is sufficient — no manual DB cleanup needed.
 
+### Component upgrade notes (Phase 2)
+
+Component-specific upgrade steps and caveats on top of the generic A/B paths above.
+
+#### Storage (`storage-api`) — fork upgrade v1.48.26 → v1.61.7
+
+The `app/storage` fork was re-based onto upstream v1.61.7. Upgrading a running deployment is **path A only** (image rebuild + `force-new-deployment`); no infra/env change is required (env keys are unchanged).
+
+```bash
+./build-and-push.sh storage
+aws ecs update-service --cluster infrastack-cluster --service storage-api \
+  --force-new-deployment --region ${AWS_REGION}
+aws ecs wait services-stable --cluster infrastack-cluster --services storage-api --region ${AWS_REGION}
+```
+
+Migration safety (verified) — existing tenant DBs already migrated to `0058` upgrade transparently:
+
+- Upstream renamed `56-…` → `0056-…`. Migration identity is keyed by `id = parseInt(prefix)`, so both resolve to id 56 (same migration); the rename only changes the stored hash.
+- The hash mismatch is auto-healed because storage runs with **`DB_ALLOW_MIGRATION_REFRESH=true`** (injected on the storage task def). **Do not set this to `'false'`** or existing tenants will refuse to boot on the renamed migration.
+- New tenant migrations `0059`/`0060` and control-plane `0027` (`ADD COLUMN IF NOT EXISTS`) are all non-locking, non-destructive, and applied automatically (per-tenant on first request, control-plane on storage startup).
+
+Verify after rollout: each existing tenant returns 200 on `GET https://<ref>.<domain>/storage/v1/bucket`, and `cd tests && PROJECT_REF=<ref> ./RUN_TESTS.sh storage` passes 8/8.
+
+#### Auth (per-tenant Google OAuth + SAML)
+
+This feature spans **four** services — rebuild and roll them in dependency order (path A for all):
+
+```bash
+for svc in tenant-manager auth function-deploy; do ./build-and-push.sh $svc; done
+./build-and-push.sh kong
+# Deploy order: tenant-manager → auth → kong → function-deploy
+for svc in tenant-manager auth-service kong-gateway function-deploy; do
+  aws ecs update-service --cluster infrastack-cluster --service $svc \
+    --force-new-deployment --region ${AWS_REGION}
+done
+```
+
+- **No new env/secret/config** — the per-tenant Google `client_secret` is encrypted at rest with the existing `ENCRYPTION_KEY` and entered per-project at runtime via `PUT /admin/v1/projects/<ref>/auth/external/google` (not a deploy-time value).
+- **tenant-manager first**: it creates the platform-DB `external_oauth_providers` table on startup and produces the `data.external` field that GoTrue consumes.
+- **kong**: the public OAuth/SAML callback routes (`/auth/v1/callback`, `/verify`, `/sso/saml/*`) are unauthenticated; the `heal-stale-plugins.lua` self-heal (see Kong note) is what makes them reachable after upgrading from the old service-level-plugin layout.
+- Verify: `cd tests && PROJECT_REF=<ref> ./RUN_TESTS.sh oauth`.
+
+> **Known issue (tracked):** `auth.flow_state` on tenant DBs cloned from the `supabase_template` template is missing the OAuth-context columns added in the schema fix, because `CREATE TABLE IF NOT EXISTS` is a no-op on the cloned table. Until the template is refreshed **and** existing tenants are backfilled (`ALTER TABLE … ADD COLUMN IF NOT EXISTS`), `GET /auth/v1/authorize?provider=google` returns 500 (`Error creating flow state`). The `oauth` suite marks this case `xfail`; flip it to a hard assert once fixed.
+
 ## Common Commands
 
 ```bash
