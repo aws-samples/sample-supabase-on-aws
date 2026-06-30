@@ -241,6 +241,22 @@ run_storage() {
     python3 -m pytest test_storage.py -v -s "$@"
 }
 
+run_oauth() {
+    echo "=========================================="
+    echo " Running test_oauth.py (Phase 2 per-tenant Google OAuth)"
+    echo "=========================================="
+    echo " O0: fetch anon key for project"
+    echo " O1: provider config CRUD (encrypt at rest, mask secret)"
+    echo " O2: GoTrue /settings reflects per-tenant google"
+    echo " O3: Kong allows public OAuth/SAML endpoints (self-heal)"
+    echo " O4: Kong still enforces key-auth on /user"
+    echo " O5: /authorize?provider=google redirects to Google with tenant client_id"
+    echo "=========================================="
+    echo ""
+    cd "$SCRIPT_DIR"
+    python3 -m pytest test_oauth.py -v -s "$@"
+}
+
 run_verify_jwt() {
     echo "=========================================="
     echo " Running test_function_verify_jwt.py (Phase 2 verify_jwt)"
@@ -324,6 +340,9 @@ run_all() {
     run_storage
     echo ""
 
+    run_oauth
+    echo ""
+
     echo "=========================================="
     echo " All test suites completed"
     echo "=========================================="
@@ -348,6 +367,7 @@ usage() {
     echo "  lifecycle          test_project_lifecycle.py - Phase 2 pause/resume/delete (7 tests)"
     echo "  verify-jwt         test_function_verify_jwt.py - Phase 2 function verify_jwt (6 tests)"
     echo "  storage            test_storage.py            - Phase 2 storage (8 tests)"
+    echo "  oauth              test_oauth.py              - Phase 2 per-tenant Google OAuth (11 tests, needs PROJECT_REF)"
     echo "  all                Run all test suites"
     echo ""
     echo "All configuration is auto-detected from CloudFormation + config.json."
@@ -368,7 +388,7 @@ usage() {
 SUITE="${1:-studio}"
 
 # Shift suite arg so remaining args pass to pytest
-if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation|functions|secrets|lifecycle|verify-jwt|storage|fn-errors)$ ]]; then
+if [[ "$SUITE" =~ ^(all|studio|auth|auth-rls|schema|realtime|isolation|functions|secrets|lifecycle|verify-jwt|storage|oauth|fn-errors)$ ]]; then
   shift 2>/dev/null || true
 fi
 
@@ -385,6 +405,7 @@ case "$SUITE" in
     verify-jwt) run_verify_jwt "$@" ;;
     fn-errors)  run_fn_errors "$@" ;;
     storage)    run_storage "$@" ;;
+    oauth)      run_oauth "$@" ;;
     all)        run_all ;;
     -h|--help) usage ;;
     *)
