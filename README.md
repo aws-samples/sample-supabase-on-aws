@@ -261,6 +261,79 @@ Optional environment variable overrides (all auto-detected if not set):
 
 How you ship a change depends on **what** you changed. There are two distinct paths — picking the wrong one is the most common reason a change appears not to take effect.
 
+### Full upgrade runbook (existing deployment → latest)
+
+End-to-end sequence for upgrading a **running** deployment to the latest code, with **zero downtime** and **no impact on existing tenant data**. The same `SupabaseStack` is updated in place — keep the stack name, account/region, and physical resource names unchanged.
+
+`config.json` and `certs/` are **not** tracked in git and are never overwritten by a pull. Your existing values are preserved.
+
+```bash
+# 0. Preconditions: docker (linux/amd64), node, pnpm, go, deno, aws cli, jq,
+#    and AWS CDK; target account already bootstrapped. Record the current
+#    code version for rollback:  git rev-parse HEAD
+```
+
+**Step 1 — Pull the latest code.** If the operator machine has a clean clone of this repo:
+
+```bash
+# Remove the previously-untracked lockfile if present (older versions did not
+# track it; the new version does, and an untracked copy blocks the merge).
+rm -f app/function-deploy/pnpm-lock.yaml
+git fetch origin && git pull origin main      # or your release branch
+```
+
+**Step 2 — Confirm `config.json` has the `storage` section.** Phase 2 added Storage; older configs predate it. If missing, copy it from `config.production.json` / `config.test.json`:
+
+```bash
+jq '.storage' config.json     # expect bucket.mode (create|existing), fileSizeLimitBytes, ...
+```
+
+**Step 3 — (recommended) Eliminate the gateway single-point window.** If `kong.desiredCount` is 1, set it to **2** and deploy once during a low-traffic window first, so subsequent gateway rolls are zero-downtime.
+
+**Step 4 — Stage the RDS CA and rebuild the changed images.** Determine which services changed with `git diff <old-version> HEAD --name-only | grep '^app/'`, then rebuild those. For the current Phase 2 release that is **storage, tenant-manager, functions, function-deploy, kong, auth** (kong is mandatory — its routes changed):
+
+```bash
+mkdir -p certs
+curl -o certs/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+for svc in storage tenant-manager functions function-deploy kong auth; do
+  ./build-and-push.sh $svc
+done
+```
+
+**Step 5 — Apply infra changes (CDK).** Review and deploy; confirm the diff contains **no replacement** of stateful resources (RDS cluster, S3 bucket, cache) — a normal upgrade only updates task definitions:
+
+```bash
+cd infra && npm run build && npx cdk diff SupabaseStack
+npx cdk deploy SupabaseStack --require-approval never && cd ..
+```
+
+**Step 6 — Force-new-deployment for every rebuilt service (critical).** `cdk deploy` does **not** pull a new `:latest` when the task definition is unchanged — code-only changes keep running the old image until you force a roll. Roll the OAuth-related services in dependency order (see the per-component notes below for why):
+
+```bash
+# tenant-manager → auth → kong → function-deploy, plus the rest you rebuilt
+for svc in tenant-manager auth-service kong-gateway function-deploy storage-api functions-service; do
+  aws ecs update-service --cluster infrastack-cluster --service $svc \
+    --force-new-deployment --region ${AWS_REGION}
+done
+for svc in tenant-manager auth-service kong-gateway function-deploy storage-api functions-service; do
+  aws ecs wait services-stable --cluster infrastack-cluster --services $svc --region ${AWS_REGION}
+done
+```
+
+**Step 7 — Verify.** Database migrations apply automatically (platform DB on service start, per-tenant DB on first request) and are additive — no manual step, no rollback needed.
+
+```bash
+cd tests && pip install -r requirements.txt
+PROJECT_REF=<existing-ref> ./RUN_TESTS.sh storage     # 8/8
+PROJECT_REF=<existing-ref> ./RUN_TESTS.sh oauth       # 10 passed, 1 xfailed (see known issue)
+./RUN_TESTS.sh isolation                              # tenant isolation regression
+./RUN_TESTS.sh auth && ./RUN_TESTS.sh studio          # auth + management regression
+```
+
+**Rollback.** This upgrade has no destructive resource or schema change. To revert: re-point a service to its previous `:<git-sha>` image tag (ECR retains history) and `force-new-deployment`, or check out the recorded base version and `cdk deploy` again. DB migrations are additive and need no rollback.
+
+See the **path A / path B** rules and the **per-component upgrade notes** below for the mechanics behind each step, including the storage migration-safety details and the OAuth deploy order.
+
 ### A. Service code change (Docker image)
 
 Changing any service under `app/*` (Kong config, GoTrue, tenant-manager, Studio, …) requires rebuilding its image and forcing ECS to pull it. **`cdk deploy` does NOT pull a new image when the image tag is unchanged** — the task definition still points at `:latest` and ECS keeps the running tasks. You must force a new deployment:
