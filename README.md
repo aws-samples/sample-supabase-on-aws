@@ -257,6 +257,52 @@ Optional environment variable overrides (all auto-detected if not set):
 | `PROJECT_REF` | Existing project ref (skip creation) |
 | `KEEP_PROJECT=1` | Keep test project after tests complete |
 
+## Updating a Deployment
+
+How you ship a change depends on **what** you changed. There are two distinct paths — picking the wrong one is the most common reason a change appears not to take effect.
+
+### A. Service code change (Docker image)
+
+Changing any service under `app/*` (Kong config, GoTrue, tenant-manager, Studio, …) requires rebuilding its image and forcing ECS to pull it. **`cdk deploy` does NOT pull a new image when the image tag is unchanged** — the task definition still points at `:latest` and ECS keeps the running tasks. You must force a new deployment:
+
+```bash
+# 1. Rebuild & push the changed service (pushes :latest + :<git-sha>)
+./build-and-push.sh <service>     # e.g. kong, auth, tenant-manager
+
+# 2. Force ECS to pull the new :latest and replace running tasks
+aws ecs update-service --cluster infrastack-cluster --service <service-name> \
+  --force-new-deployment --region ${AWS_REGION}
+
+# 3. Wait for the rollout to stabilize
+aws ecs wait services-stable --cluster infrastack-cluster --services <service-name> \
+  --region ${AWS_REGION}
+```
+
+ECR repo names vs. ECS service names differ for a few services:
+
+| `build-and-push.sh` arg | ECS service name |
+|-------------------------|------------------|
+| `kong` | `kong-gateway` |
+| `auth` | `auth-service` |
+| `functions` | `functions-service` |
+| `storage` | `storage-api` |
+| `tenant-manager` / `studio` / `function-deploy` / `postgres-meta` | same name |
+
+### B. Infrastructure change (CDK)
+
+Changing `infra/` (VPC, RDS, ECS task definitions, ALB, IAM, env vars, …) goes through CDK. A task-definition change (new env var, CPU/memory, etc.) **does** roll the service automatically:
+
+```bash
+cd infra && npm run build && npx cdk diff SupabaseStack   # preview
+npx cdk deploy SupabaseStack --require-approval never
+```
+
+> Rule of thumb: **image content → path A (`force-new-deployment`); task/infra definition → path B (`cdk deploy`).** If you changed both (e.g. new image **and** a new env var it reads), do B then A.
+
+### Kong note (DB-backed declarative config)
+
+Kong runs DB-backed and imports `kong.yml.tpl` on startup via `kong config db_import`, which is an **incremental upsert — it never deletes** entities removed from the config. The entrypoint runs an idempotent self-heal (`heal-stale-plugins.lua`) on each start to drop stale service-level auth plugins left behind by older configs, so a plain rebuild + `force-new-deployment` of `kong-gateway` is sufficient — no manual DB cleanup needed.
+
 ## Common Commands
 
 ```bash
