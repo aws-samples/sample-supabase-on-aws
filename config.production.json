@@ -94,6 +94,15 @@
       }
     }
   },
+  "storage": {
+    "bucket": {
+      "_comment": "mode 'create' = CDK creates/owns the bucket (name optional, defaults to supabase-storage-{env}-{account}-{region}). mode 'existing' = reference a pre-existing bucket by name; CDK only grants the storage task role access and never creates/deletes it.",
+      "mode": "existing",
+      "name": "<your-existing-s3-bucket-name>"
+    },
+    "fileSizeLimitBytes": 52428800,
+    "imageTransformationEnabled": false
+  },
   "tags": {
     "Project": "Supabase-Platform",
     "Environment": "Production",

@@ -94,6 +94,14 @@
       }
     }
   },
+  "storage": {
+    "bucket": {
+      "_comment": "mode 'create' = CDK creates/owns the bucket (name optional, defaults to supabase-storage-{env}-{account}-{region}). mode 'existing' = reference a pre-existing bucket by name (set bucket.name); CDK only grants access, never creates/deletes it.",
+      "mode": "create"
+    },
+    "fileSizeLimitBytes": 52428800,
+    "imageTransformationEnabled": false
+  },
   "tags": {
     "Project": "Supabase-Platform",
     "Environment": "Test",

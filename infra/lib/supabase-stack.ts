@@ -126,6 +126,16 @@ interface StackConfig {
     };
   };
   storage?: {
+    // Bucket provisioning mode:
+    //   'create'   (default) — CDK creates and owns the S3 bucket.
+    //   'existing'           — reference a pre-existing bucket by name; CDK
+    //                          never creates/deletes it, only grants the
+    //                          storage task role read/write access to it.
+    bucket?: {
+      mode?: 'create' | 'existing';
+      name?: string;
+    };
+    /** @deprecated use bucket.name with mode:'create'. Kept for back-compat. */
     bucketName?: string;
     fileSizeLimitBytes?: number;
     imageTransformationEnabled?: boolean;
@@ -1248,33 +1258,56 @@ export class SupabaseStack extends cdk.Stack {
     // ========================================
     // Single S3 bucket shared by every project; tenant isolation lives at the
     // object-key prefix layer (key = {tenant_id}/{bucket}/{path}/{version}),
-    // matching the upstream behavior. The bucket name is deterministic per
-    // (env, account, region) so re-deploys land on the same bucket.
-    const storageBucketName = config.storage?.bucketName
-      ?? `supabase-storage-${config.project.environment}-${accountId}-${region}`;
-    const storageBucket = new s3.Bucket(this, 'StorageBucket', {
-      bucketName: storageBucketName,
-      encryption: s3.BucketEncryption.S3_MANAGED,
-      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-      versioned: false,
-      removalPolicy: isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: !isProduction,
-      cors: [
-        {
-          allowedOrigins: ['*'],
-          allowedMethods: [
-            s3.HttpMethods.GET,
-            s3.HttpMethods.PUT,
-            s3.HttpMethods.POST,
-            s3.HttpMethods.DELETE,
-            s3.HttpMethods.HEAD,
-          ],
-          allowedHeaders: ['*'],
-          exposedHeaders: ['ETag', 'Content-Length', 'Content-Type', 'x-amz-version-id'],
-          maxAge: 3600,
-        },
-      ],
-    });
+    // matching the upstream behavior.
+    //
+    // Two provisioning modes (config.storage.bucket.mode):
+    //   'create'   (default) — CDK creates and owns the bucket. The name is
+    //              deterministic per (env, account, region) so re-deploys land
+    //              on the same bucket.
+    //   'existing'           — reference a pre-existing bucket by name. CDK does
+    //              NOT create or delete it; it only grants the storage task role
+    //              read/write access (see grantReadWrite below).
+    const bucketMode = config.storage?.bucket?.mode ?? 'create';
+    // Back-compat: legacy storage.bucketName is honored as the create-mode name.
+    const configuredBucketName = config.storage?.bucket?.name ?? config.storage?.bucketName;
+
+    let storageBucket: s3.IBucket;
+    if (bucketMode === 'existing') {
+      if (!configuredBucketName) {
+        throw new Error(
+          "config.storage.bucket.mode is 'existing' but no bucket name was provided. " +
+          'Set config.storage.bucket.name to the existing bucket name.',
+        );
+      }
+      // Reference only — CDK never creates/mutates/deletes this bucket.
+      storageBucket = s3.Bucket.fromBucketName(this, 'StorageBucket', configuredBucketName);
+    } else {
+      const storageBucketName = configuredBucketName
+        ?? `supabase-storage-${config.project.environment}-${accountId}-${region}`;
+      storageBucket = new s3.Bucket(this, 'StorageBucket', {
+        bucketName: storageBucketName,
+        encryption: s3.BucketEncryption.S3_MANAGED,
+        blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+        versioned: false,
+        removalPolicy: isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+        autoDeleteObjects: !isProduction,
+        cors: [
+          {
+            allowedOrigins: ['*'],
+            allowedMethods: [
+              s3.HttpMethods.GET,
+              s3.HttpMethods.PUT,
+              s3.HttpMethods.POST,
+              s3.HttpMethods.DELETE,
+              s3.HttpMethods.HEAD,
+            ],
+            allowedHeaders: ['*'],
+            exposedHeaders: ['ETag', 'Content-Length', 'Content-Type', 'x-amz-version-id'],
+            maxAge: 3600,
+          },
+        ],
+      });
+    }
 
     const storageSG = new ec2.SecurityGroup(this, 'StorageSG', {
       vpc: vpc,
