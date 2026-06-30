@@ -17,7 +17,7 @@ import {
 } from '../../db/repositories/rds-instance.repository.js'
 import { getCredentialProvider } from '../../common/crypto/credential-provider.js'
 import { resolveInstanceCredentials, removeInstancePool } from '../../db/instance-connection.js'
-import { ensureTemplateExistsOnInstance } from '../provisioning/template-initializer.js'
+import { ensureTemplateExistsOnInstance, healAuthSchemaOnInstance } from '../provisioning/template-initializer.js'
 import type { DbInstance } from '../../db/types.js'
 import type { CreateRdsInstanceInput, UpdateRdsInstanceInput } from '../../types/index.js'
 
@@ -68,6 +68,8 @@ export async function createRdsInstance(input: CreateRdsInstanceInput): Promise<
     try {
       const conn = await resolveInstanceCredentials(instance)
       await ensureTemplateExistsOnInstance(conn)
+      // Heal in case a stale template lingered from a prior registration.
+      await healAuthSchemaOnInstance(conn)
     } catch (error) {
       console.warn(
         `Template init failed on ${instance.identifier}, will fall back to legacy creation: ${error instanceof Error ? error.message : error}`

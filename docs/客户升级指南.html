@@ -305,6 +305,11 @@ npx cdk deploy SupabaseStack --require-approval never</pre>
   <h3>Kong 说明(DB-backed 声明式配置)</h3>
   <p>Kong 以 DB-backed 模式运行,启动时经 <code>kong config db_import</code> 导入 <code>kong.yml.tpl</code>,这是<b>增量 upsert——从不删除</b>配置里已移除的实体。入口脚本在每次启动时跑一个幂等自愈(<code>heal-stale-plugins.lua</code>),清掉旧配置遗留的 service 级鉴权插件。因此对 <code>kong-gateway</code> 直接重建 + <code>force-new-deployment</code> 即可,无需手动清理 DB。</p>
 
+  <h3>Auth schema 说明(模板克隆 + 存量租户)</h3>
+  <p>新租户库是从缓存的 <code>supabase_template</code> 库<b>克隆</b>而来,并非在空库上跑 DDL;而 schema DDL 用 <code>CREATE TABLE IF NOT EXISTS</code>,对已存在的表是 no-op。因此<b>只改 <code>auth-schema.ts</code> 的 <code>CREATE TABLE</code> 永远无法补列</b>——模板和存量租户库都不会拿到新列,新建租户还会继续克隆旧模板。</p>
+  <p>tenant-manager 启动时会对模板库<b>以及每个已注册实例上的全部存量租户库</b>执行一组幂等的 <code>ALTER TABLE ... ADD COLUMN IF NOT EXISTS</code>(见 <code>AUTH_SCHEMA_HEAL_STATEMENTS</code>),让全新部署与升级部署都收敛到当前 schema。该自愈幂等(列已存在即跳过)且 fail-open(被锁/暂停的租户库自动跳过,绝不阻断启动)。它<b>纯加列/加约束,不删除、不修改任何现有数据</b>。所以对 <code>tenant-manager</code> 直接重建 + <code>force-new-deployment</code> 即可,无需手动 DROP 模板库或逐库补列。</p>
+  <div class="caution"><span class="label-c">改表必须同步加补丁:</span>给 <code>auth-schema.ts</code> 的某张表加列后,务必同时往 <code>AUTH_SCHEMA_HEAL_STATEMENTS</code> 加一条对应的 <code>ADD COLUMN IF NOT EXISTS</code>,否则改动只到代码、永远到不了数据库。</div>
+
   <!-- 12 -->
   <h2 id="feat">12. 二期 6 大修改项:部署 · 使用 · 测试</h2>
   <p>本节按二期需求的 6 个修改项逐一说明:<b>涉及哪些服务(部署)、接口怎么用(使用)、如何验证(测试)</b>。前 1-10 节是通用升级流程;本节是各能力的细化。下表中 <code>&lt;ref&gt;</code> 为项目 ID,<code>&lt;domain&gt;</code> 为基础域名,<code>&lt;studio-alb&gt;</code> 为 Studio ALB 域名,<code>&lt;admin-key&gt;</code> 为管理密钥(Secrets Manager <code>supabase/admin-api-key</code>)。</p>

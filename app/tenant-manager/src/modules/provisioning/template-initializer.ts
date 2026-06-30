@@ -11,7 +11,8 @@ import {
   withInstanceTenantClient,
   type InstanceConnectionInfo,
 } from '../../db/instance-connection.js'
-import { AUTH_SCHEMA_DDL } from './auth-schema.js'
+import { findProjects } from '../../db/repositories/project.repository.js'
+import { AUTH_SCHEMA_DDL, AUTH_SCHEMA_HEAL_STATEMENTS } from './auth-schema.js'
 
 const TEMPLATE_DB_NAME = 'supabase_template'
 
@@ -175,6 +176,95 @@ export async function ensureTemplateExistsOnInstance(conn: InstanceConnectionInf
   }
 
   console.debug(`Template database created successfully on instance ${conn.instanceId}`)
+}
+
+/**
+ * Apply the idempotent auth-schema heal statements on a single open client.
+ * Each statement runs independently so one failure never blocks the rest.
+ * Returns the number of statements that errored (0 = fully healed).
+ */
+async function applyAuthHeal(client: pg.Client): Promise<number> {
+  let failed = 0
+  for (const stmt of AUTH_SCHEMA_HEAL_STATEMENTS) {
+    try {
+      await client.query(stmt)
+    } catch (error) {
+      failed++
+      console.debug(
+        '  Note: auth heal statement had issue:',
+        error instanceof Error ? error.message : error
+      )
+    }
+  }
+  return failed
+}
+
+/**
+ * Self-heal the auth schema on a single RDS instance.
+ *
+ * Brings the template database AND every existing tenant database on the
+ * instance up to the current auth schema by running idempotent ALTERs
+ * (AUTH_SCHEMA_HEAL_STATEMENTS). This closes the gap where new tenants are
+ * cloned from a cached `supabase_template` and existing tenants were created
+ * before a column was added — neither picks up `CREATE TABLE IF NOT EXISTS`
+ * changes on its own.
+ *
+ * Fail-open by design: any per-database error is logged and skipped so a
+ * single unreachable/locked database never blocks startup. On a clean install
+ * every statement is a no-op (columns already present), so this is cheap.
+ */
+export async function healAuthSchemaOnInstance(conn: InstanceConnectionInfo): Promise<void> {
+  // 1. Heal the template so all FUTURE clones already carry the columns.
+  try {
+    await withInstanceTenantClient(conn, TEMPLATE_DB_NAME, async (client) => {
+      const failed = await applyAuthHeal(client)
+      if (failed > 0) {
+        console.warn(
+          `Auth heal on template (instance ${conn.instanceId}) completed with ${failed} skipped statement(s)`
+        )
+      }
+    })
+  } catch (error) {
+    console.warn(
+      `Failed to heal auth schema on template (instance ${conn.instanceId}): ${error instanceof Error ? error.message : error}`
+    )
+  }
+
+  // 2. Heal every existing tenant database on this instance. Page through
+  //    findProjects so a large fleet is not silently capped at the default
+  //    page size.
+  let healed = 0
+  let page = 1
+  const pageSize = 100
+  try {
+    for (;;) {
+      const projects = await findProjects({ db_instance_id: conn.instanceId, page, limit: pageSize })
+      if (projects.length === 0) break
+
+      for (const project of projects) {
+        if (!project.db_name) continue
+        try {
+          await withInstanceTenantClient(conn, project.db_name, async (client) => {
+            await applyAuthHeal(client)
+          })
+          healed++
+        } catch (error) {
+          // Non-fatal: a paused/locked/dropped tenant DB must not block startup.
+          console.warn(
+            `Skipped auth heal for tenant ${project.db_name} (instance ${conn.instanceId}): ${error instanceof Error ? error.message : error}`
+          )
+        }
+      }
+
+      if (projects.length < pageSize) break
+      page++
+    }
+    console.debug(`Auth heal applied to ${healed} tenant database(s) on instance ${conn.instanceId}`)
+  } catch (error) {
+    console.warn(
+      `Failed to enumerate tenant databases for auth heal (instance ${conn.instanceId}): ${error instanceof Error ? error.message : error}`
+    )
+  }
 }
 
 /**

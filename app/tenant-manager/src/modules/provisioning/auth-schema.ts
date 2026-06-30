@@ -678,3 +678,46 @@ GRANT EXECUTE ON FUNCTION auth.role() TO anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION auth.email() TO anon, authenticated, service_role;
 GRANT EXECUTE ON FUNCTION auth.jwt() TO anon, authenticated, service_role;
 `
+
+/**
+ * Idempotent self-heal statements for the auth schema.
+ *
+ * Why this exists separately from AUTH_SCHEMA_DDL: new tenant databases are not
+ * built by running the DDL on an empty database — they are cloned from the
+ * `supabase_template` database (see provisioner.service.ts). The template is
+ * created once and never refreshed, and AUTH_SCHEMA_DDL uses
+ * `CREATE TABLE IF NOT EXISTS`, which is a no-op on an already-existing table.
+ * So when a column is added to a table here, neither the cached template nor
+ * any existing tenant database picks it up — editing the CREATE TABLE alone
+ * can never add a column to a table that already exists.
+ *
+ * These statements close that gap: each is an idempotent ALTER that brings an
+ * already-existing table up to the current schema. They run on startup against
+ * the template AND every existing tenant database (see healAuthSchema), so both
+ * fresh and upgraded deployments converge. Each is safe to run repeatedly.
+ *
+ * When you add a column/constraint to a table above, add the matching
+ * `ADD COLUMN IF NOT EXISTS` / idempotent constraint statement here too.
+ */
+export const AUTH_SCHEMA_HEAL_STATEMENTS: string[] = [
+  // flow_state OAuth/SSO context columns
+  // (GoTrue migration 20260115000000_add_flow_state_oauth_context)
+  `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS invite_token text NULL`,
+  `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS referrer text NULL`,
+  `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS oauth_client_state_id uuid NULL`,
+  `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS linking_target_id uuid NULL`,
+  `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS email_optional boolean NOT NULL DEFAULT FALSE`,
+
+  // oauth_clients OAuth 2.1 token endpoint auth method (column + CHECK).
+  // ADD CONSTRAINT has no IF NOT EXISTS, so guard it with a catch of
+  // duplicate_object to stay idempotent.
+  `ALTER TABLE auth.oauth_clients ADD COLUMN IF NOT EXISTS token_endpoint_auth_method text NOT NULL DEFAULT 'client_secret_basic'`,
+  `DO $$ BEGIN
+     ALTER TABLE auth.oauth_clients
+       ADD CONSTRAINT oauth_clients_token_endpoint_auth_method_check
+       CHECK (token_endpoint_auth_method IN ('client_secret_basic', 'client_secret_post', 'none'));
+   EXCEPTION
+     WHEN duplicate_object THEN NULL;
+     WHEN duplicate_table THEN NULL;
+   END $$`,
+]

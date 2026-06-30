@@ -15,7 +15,7 @@ import { getSystemPool } from './db/connection.js'
 import { getPlatformPool } from './db/platform-connection.js'
 import { findRdsInstances } from './db/repositories/rds-instance.repository.js'
 import { resolveInstanceCredentials } from './db/instance-connection.js'
-import { ensureTemplateExistsOnInstance } from './modules/provisioning/template-initializer.js'
+import { ensureTemplateExistsOnInstance, healAuthSchemaOnInstance } from './modules/provisioning/template-initializer.js'
 import { healthRoutes } from './modules/health/health.routes.js'
 import { projectRoutes } from './modules/project/project.routes.js'
 import { rdsInstanceRoutes } from './modules/rds-instance/rds-instance.routes.js'
@@ -236,6 +236,11 @@ export async function buildApp(): Promise<FastifyInstance> {
         const conn = await resolveInstanceCredentials(instance)
         await ensureTemplateExistsOnInstance(conn)
         fastify.log.info(`Template ensured on instance ${instance.identifier}`)
+        // Bring the template + existing tenant DBs up to the current auth
+        // schema. Idempotent and fail-open: no-op on clean installs, closes
+        // the cloned-from-stale-template gap on upgrades.
+        await healAuthSchemaOnInstance(conn)
+        fastify.log.info(`Auth schema healed on instance ${instance.identifier}`)
       } catch (error) {
         fastify.log.warn(
           'Failed to ensure template on instance %s: %s',
