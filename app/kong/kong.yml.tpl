@@ -406,11 +406,7 @@ services:
   # ============================================
   - name: auth-service
     url: ${KONG_AUTH_SERVICE_URL}
-    routes:
-      - name: auth-route
-        paths:
-          - /auth/v1
-        strip_path: true
+    # CORS applies to every auth route (shared, no auth dependency).
     plugins:
       - name: cors
         config:
@@ -429,60 +425,110 @@ services:
             - "*"
           credentials: true
           max_age: 3600
+    routes:
+      # ----------------------------------------------------------------
+      # Public auth callbacks — hit directly by browsers / external IdPs
+      # (Google OAuth redirect, email confirmation links, SAML ACS) which
+      # cannot carry an apikey. These MUST NOT require key-auth. The
+      # subdomain -> X-Tenant-Id injection is still applied so GoTrue
+      # resolves the right tenant. These paths are more specific than the
+      # plain `/auth/v1` route, so Kong matches them here first.
+      #
+      # strip_path is FALSE here: stripping the full matched path (e.g.
+      # `/auth/v1/callback`) would forward `/` to GoTrue (404). Instead the
+      # pre-function strips only the `/auth/v1` prefix via set_path, so
+      # GoTrue receives `/callback`, `/verify`, etc.
+      # ----------------------------------------------------------------
+      - name: auth-public-route
+        paths:
+          - /auth/v1/callback
+          - /auth/v1/verify
+          - /auth/v1/sso/saml/acs
+          - /auth/v1/sso/saml/metadata
+        strip_path: false
+        plugins:
+          - name: pre-function
+            config:
+              access:
+                - |
+                  -- Strip the fixed-length "/auth/v1" (8 chars) prefix so
+                  -- GoTrue sees /callback etc. sub(9) avoids the pattern engine.
+                  local path = kong.request.get_path()
+                  local stripped = path:sub(9)
+                  if stripped == "" then stripped = "/" end
+                  kong.service.request.set_path(stripped)
 
-      - name: pre-function
-        config:
-          access:
-            - |
-              local host = kong.request.get_header("Host")
-              local project_id
+                  -- Resolve tenant from subdomain (mirrors auth-route below).
+                  -- match stops at the first dot, so a trailing :port is ignored.
+                  local host = kong.request.get_header("Host")
+                  if host then
+                    local subdomain = host:match("^([^%.]+)%.")
+                    if subdomain and subdomain ~= "api" then
+                      kong.service.request.set_header("X-Project-ID", subdomain)
+                      kong.service.request.set_header("X-Tenant-Id", subdomain)
+                      kong.log.debug("Extracted project-id from subdomain: ", subdomain)
+                    end
+                  end
 
-              if host then
-                host = host:gsub(":%d+$", "")
-                local subdomain = host:match("^([^%.]+)%.")
-                if subdomain and subdomain ~= "api" then
-                  project_id = subdomain
-                  kong.service.request.set_header("X-Project-ID", project_id)
-                  kong.service.request.set_header("X-Tenant-Id", project_id)
-                  kong.log.debug("Extracted project-id from subdomain: ", project_id)
-                end
-              end
+      # ----------------------------------------------------------------
+      # All other /auth/v1 endpoints require a project apikey.
+      # ----------------------------------------------------------------
+      - name: auth-route
+        paths:
+          - /auth/v1
+        strip_path: true
+        plugins:
+          - name: pre-function
+            config:
+              access:
+                - |
+                  -- Resolve tenant from subdomain (mirrors auth-public-route above).
+                  -- match stops at the first dot, so a trailing :port is ignored.
+                  local host = kong.request.get_header("Host")
+                  if host then
+                    local subdomain = host:match("^([^%.]+)%.")
+                    if subdomain and subdomain ~= "api" then
+                      kong.service.request.set_header("X-Project-ID", subdomain)
+                      kong.service.request.set_header("X-Tenant-Id", subdomain)
+                      kong.log.debug("Extracted project-id from subdomain: ", subdomain)
+                    end
+                  end
 
-      - name: key-auth
-        config:
-          key_names:
-            - apikey
-          hide_credentials: false
-          anonymous: ~
+          - name: key-auth
+            config:
+              key_names:
+                - apikey
+              hide_credentials: false
+              anonymous: ~
 
-      # Validate API key belongs to the project (runs after key-auth)
-      - name: post-function
-        config:
-          access:
-            - |
-              local consumer = kong.client.get_consumer()
-              local project_id = kong.request.get_header("X-Project-ID")
+          # Validate API key belongs to the project (runs after key-auth)
+          - name: post-function
+            config:
+              access:
+                - |
+                  local consumer = kong.client.get_consumer()
+                  local project_id = kong.request.get_header("X-Project-ID")
 
-              if consumer and consumer.username and project_id then
-                local consumer_project = consumer.username:match("^(.+)%-%-")
+                  if consumer and consumer.username and project_id then
+                    local consumer_project = consumer.username:match("^(.+)%-%-")
 
-                if not consumer_project or consumer_project ~= project_id then
-                  kong.log.err("API key project mismatch: consumer=", consumer.username, " requested_project=", project_id)
-                  return kong.response.exit(403, {
-                    error = "Forbidden",
-                    message = "API key does not belong to this project"
-                  })
-                end
+                    if not consumer_project or consumer_project ~= project_id then
+                      kong.log.err("API key project mismatch: consumer=", consumer.username, " requested_project=", project_id)
+                      return kong.response.exit(403, {
+                        error = "Forbidden",
+                        message = "API key does not belong to this project"
+                      })
+                    end
 
-                kong.log.debug("API key validated for project: ", project_id)
-              end
+                    kong.log.debug("API key validated for project: ", project_id)
+                  end
 
-      - name: acl
-        config:
-          allow:
-            - anon
-            - admin
-          hide_groups_header: true
+          - name: acl
+            config:
+              allow:
+                - anon
+                - admin
+              hide_groups_header: true
 
   - name: tenant-manager
     url: ${KONG_TENANT_MANAGER_URL}
