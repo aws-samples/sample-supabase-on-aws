@@ -8,6 +8,7 @@ import { createAuthPreHandler } from '../../common/middleware/auth.middleware.js
 import { validateBody, validateQuery, validateParams } from '../../common/validation/middleware.js'
 import { projectRefSchema } from '../../common/validation/schemas.js'
 import { createProjectSchema, updateProjectSchema, listProjectsSchema } from './project.schemas.js'
+import { googleProviderSchema } from './oauth-provider.schemas.js'
 import {
   provisionProject,
   deprovisionProject,
@@ -20,6 +21,13 @@ import {
   checkProjectHealth,
   getProjectDatabaseCredentials,
 } from './project.service.js'
+import {
+  setGoogleProvider,
+  getGoogleProviderMasked,
+  deleteGoogleProvider,
+  buildExternalConfigForGoTrue,
+} from './oauth-provider.service.js'
+import type { GoogleProviderInput } from './oauth-provider.schemas.js'
 import { getJwtSecretForProject } from '../../db/platform-queries.js'
 import { NotFoundError, BadRequestError, TenantManagerError } from '../../common/errors/index.js'
 
@@ -86,21 +94,93 @@ export async function projectRoutes(fastify: FastifyInstance): Promise<void> {
     },
     async (request, _reply) => {
       const { ref } = request.params as z.infer<typeof projectRefSchema>
-      const project = await getProjectByRef(ref)
+
+      // These three reads are independent, so fetch them concurrently:
+      //   - project row
+      //   - jwt_secret from supabase_platform.jwt_keys for GoTrue JWT signing
+      //   - per-tenant external OAuth providers (decrypted) for GoTrue
+      const [project, jwtSecret, external] = await Promise.all([
+        getProjectByRef(ref),
+        getJwtSecretForProject(ref),
+        buildExternalConfigForGoTrue(ref),
+      ])
 
       if (!project) {
         throw new NotFoundError(`Project not found: ${ref}`)
       }
 
-      // Fetch jwt_secret from supabase_platform.jwt_keys for GoTrue JWT signing
-      const jwtSecret = await getJwtSecretForProject(ref)
-
       return {
         data: {
           ...project,
           jwt_secret: jwtSecret || undefined,
+          external: external || undefined,
         },
       }
+    }
+  )
+
+  // ---- Per-tenant external OAuth provider: Google ----
+
+  // Set/replace the Google provider config for a project.
+  fastify.put(
+    '/admin/v1/projects/:ref/auth/external/google',
+    {
+      preHandler: [authPreHandler, validateParams(projectRefSchema), validateBody(googleProviderSchema)],
+    },
+    async (request, _reply) => {
+      const { ref } = request.params as z.infer<typeof projectRefSchema>
+      const input = request.body as GoogleProviderInput
+
+      const project = await getProjectByRef(ref)
+      if (!project) {
+        throw new NotFoundError(`Project not found: ${ref}`)
+      }
+
+      await setGoogleProvider(ref, input)
+
+      const config = await getGoogleProviderMasked(ref)
+      return { data: config }
+    }
+  )
+
+  // Get the Google provider config (secret masked).
+  fastify.get(
+    '/admin/v1/projects/:ref/auth/external/google',
+    {
+      preHandler: [authPreHandler, validateParams(projectRefSchema)],
+    },
+    async (request, _reply) => {
+      const { ref } = request.params as z.infer<typeof projectRefSchema>
+
+      const project = await getProjectByRef(ref)
+      if (!project) {
+        throw new NotFoundError(`Project not found: ${ref}`)
+      }
+
+      const config = await getGoogleProviderMasked(ref)
+      if (!config) {
+        throw new NotFoundError(`Google provider not configured for project: ${ref}`)
+      }
+      return { data: config }
+    }
+  )
+
+  // Delete the Google provider config.
+  fastify.delete(
+    '/admin/v1/projects/:ref/auth/external/google',
+    {
+      preHandler: [authPreHandler, validateParams(projectRefSchema)],
+    },
+    async (request, reply) => {
+      const { ref } = request.params as z.infer<typeof projectRefSchema>
+
+      const project = await getProjectByRef(ref)
+      if (!project) {
+        throw new NotFoundError(`Project not found: ${ref}`)
+      }
+
+      await deleteGoogleProvider(ref)
+      return reply.status(204).send()
     }
   )
 

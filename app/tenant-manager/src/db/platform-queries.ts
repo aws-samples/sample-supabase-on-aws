@@ -287,8 +287,8 @@ export async function getPostgrestConfig(
  * Delete all data for a project from the 4 platform tables.
  *
  * Order matters because of foreign-key constraints:
- *   api_keys, jwt_keys, postgrest_config  (all reference projects.id)
- *   projects                              (parent row, deleted last)
+ *   api_keys, jwt_keys, postgrest_config, external_oauth_providers (all reference projects.id)
+ *   projects                                                       (parent row, deleted last)
  */
 export async function deletePlatformProjectData(
   projectId: string,
@@ -297,7 +297,114 @@ export async function deletePlatformProjectData(
   await platformQuery('DELETE FROM api_keys WHERE project_id = $1', [projectId])
   await platformQuery('DELETE FROM jwt_keys WHERE project_id = $1', [projectId])
   await platformQuery('DELETE FROM postgrest_config WHERE project_id = $1', [projectId])
+  await platformQuery('DELETE FROM external_oauth_providers WHERE project_id = $1', [projectId])
 
   // Delete parent row last
   await platformQuery('DELETE FROM projects WHERE id = $1', [projectId])
+}
+
+// ---------------------------------------------------------------------------
+// 9. external_oauth_providers queries
+// ---------------------------------------------------------------------------
+
+/**
+ * A stored external OAuth provider row. client_secret is the AES-256-CBC
+ * ciphertext (see common/crypto/encryption.ts) — it is never stored in plain
+ * text.
+ */
+export interface ExternalOAuthProviderRecord {
+  project_id: string
+  provider: string
+  enabled: boolean
+  client_id: string
+  client_secret: string
+  redirect_uri: string | null
+  skip_nonce_check: boolean
+}
+
+/**
+ * Insert (or update on conflict) the external OAuth provider config for a
+ * project. encryptedSecret MUST already be the ciphertext; this layer performs
+ * no encryption.
+ *
+ * ON CONFLICT (project_id, provider) — UNIQUE constraint.
+ */
+export async function upsertExternalOAuthProvider(
+  projectId: string,
+  provider: string,
+  input: {
+    enabled: boolean
+    clientId: string
+    encryptedSecret: string
+    redirectUri: string | null
+    skipNonceCheck: boolean
+  },
+): Promise<void> {
+  await platformQuery(
+    `INSERT INTO external_oauth_providers
+       (project_id, provider, enabled, client_id, client_secret, redirect_uri, skip_nonce_check, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (project_id, provider) DO UPDATE SET
+       enabled          = $3,
+       client_id        = $4,
+       client_secret    = $5,
+       redirect_uri     = $6,
+       skip_nonce_check = $7,
+       updated_at       = now()`,
+    [
+      projectId,
+      provider,
+      input.enabled,
+      input.clientId,
+      input.encryptedSecret,
+      input.redirectUri,
+      input.skipNonceCheck,
+    ],
+  )
+}
+
+/**
+ * Retrieve a single external OAuth provider config for a project.
+ * Returns null when the project has no config for that provider.
+ */
+export async function getExternalOAuthProvider(
+  projectId: string,
+  provider: string,
+): Promise<ExternalOAuthProviderRecord | null> {
+  const result = await platformQuery<ExternalOAuthProviderRecord>(
+    `SELECT project_id, provider, enabled, client_id, client_secret, redirect_uri, skip_nonce_check
+     FROM external_oauth_providers
+     WHERE project_id = $1 AND provider = $2
+     LIMIT 1`,
+    [projectId, provider],
+  )
+  return result.rows[0] ?? null
+}
+
+/**
+ * Retrieve all external OAuth provider configs for a project.
+ */
+export async function getExternalOAuthProviders(
+  projectId: string,
+): Promise<ExternalOAuthProviderRecord[]> {
+  const result = await platformQuery<ExternalOAuthProviderRecord>(
+    `SELECT project_id, provider, enabled, client_id, client_secret, redirect_uri, skip_nonce_check
+     FROM external_oauth_providers
+     WHERE project_id = $1`,
+    [projectId],
+  )
+  return result.rows
+}
+
+/**
+ * Delete a single external OAuth provider config for a project.
+ */
+export async function deleteExternalOAuthProvider(
+  projectId: string,
+  provider: string,
+): Promise<void> {
+  await platformQuery(
+    'DELETE FROM external_oauth_providers WHERE project_id = $1 AND provider = $2',
+    [projectId, provider],
+  )
 }

@@ -199,10 +199,25 @@ export async function buildApp(): Promise<FastifyInstance> {
         db_use_legacy_gucs TEXT DEFAULT 'false'
       );
 
+      CREATE TABLE IF NOT EXISTS external_oauth_providers (
+        id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        project_id       TEXT NOT NULL REFERENCES projects(id),
+        provider         TEXT NOT NULL,
+        enabled          BOOLEAN NOT NULL DEFAULT false,
+        client_id        TEXT NOT NULL,
+        client_secret    TEXT NOT NULL,
+        redirect_uri     TEXT,
+        skip_nonce_check BOOLEAN NOT NULL DEFAULT false,
+        created_at       TIMESTAMPTZ DEFAULT now(),
+        updated_at       TIMESTAMPTZ DEFAULT now(),
+        UNIQUE (project_id, provider)
+      );
+
       CREATE INDEX IF NOT EXISTS idx_api_keys_project_id ON api_keys(project_id);
       CREATE INDEX IF NOT EXISTS idx_api_keys_key_value ON api_keys(key_value);
       CREATE INDEX IF NOT EXISTS idx_jwt_keys_project_id ON jwt_keys(project_id);
       CREATE INDEX IF NOT EXISTS idx_jwt_keys_project_status ON jwt_keys(project_id, status);
+      CREATE INDEX IF NOT EXISTS idx_ext_oauth_project_id ON external_oauth_providers(project_id);
     `)
     fastify.log.info('supabase_platform schema migration completed')
   } catch (error) {

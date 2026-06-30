@@ -407,27 +407,35 @@ CREATE INDEX IF NOT EXISTS saml_relay_states_created_at_idx ON auth.saml_relay_s
 
 COMMENT ON TABLE auth.saml_relay_states IS 'Auth: Contains SAML Relay State information for each Service Provider initiated login.';
 
--- auth.flow_state - PKCE flow state storage
+-- auth.flow_state - OAuth/SSO + PKCE flow state storage
+-- PKCE fields (auth_code, code_challenge[_method]) are nullable to support the
+-- implicit/OAuth-redirect flow. The OAuth context columns below mirror
+-- GoTrue migration 20260115000000_add_flow_state_oauth_context.
 CREATE TABLE IF NOT EXISTS auth.flow_state (
     id uuid PRIMARY KEY,
     user_id uuid NULL,
-    auth_code text NOT NULL,
-    code_challenge_method code_challenge_method NOT NULL,
-    code_challenge text NOT NULL,
+    auth_code text NULL,
+    code_challenge_method code_challenge_method NULL,
+    code_challenge text NULL,
     provider_type text NOT NULL,
     provider_access_token text NULL,
     provider_refresh_token text NULL,
     created_at timestamptz NULL,
     updated_at timestamptz NULL,
     authentication_method text NOT NULL,
-    auth_code_issued_at timestamptz NULL
+    auth_code_issued_at timestamptz NULL,
+    invite_token text NULL,
+    referrer text NULL,
+    oauth_client_state_id uuid NULL,
+    linking_target_id uuid NULL,
+    email_optional boolean NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_auth_code ON auth.flow_state (auth_code);
 CREATE INDEX IF NOT EXISTS idx_user_id_auth_method ON auth.flow_state (user_id, authentication_method);
 CREATE INDEX IF NOT EXISTS flow_state_created_at_idx ON auth.flow_state (created_at DESC);
 
-COMMENT ON TABLE auth.flow_state IS 'stores metadata for pkce logins';
+COMMENT ON TABLE auth.flow_state IS 'Stores metadata for all OAuth/SSO login flows';
 
 -- Add foreign key for saml_relay_states.flow_state_id after flow_state table is created
 DO $$
@@ -473,10 +481,12 @@ CREATE TABLE IF NOT EXISTS auth.oauth_clients (
     updated_at timestamptz NOT NULL DEFAULT now(),
     deleted_at timestamptz NULL,
     client_type auth.oauth_client_type NOT NULL DEFAULT 'confidential',
+    token_endpoint_auth_method text NOT NULL DEFAULT 'client_secret_basic',
     CONSTRAINT oauth_clients_pkey PRIMARY KEY (id),
     CONSTRAINT oauth_clients_client_name_length CHECK (char_length(client_name) <= 1024),
     CONSTRAINT oauth_clients_client_uri_length CHECK (char_length(client_uri) <= 2048),
-    CONSTRAINT oauth_clients_logo_uri_length CHECK (char_length(logo_uri) <= 2048)
+    CONSTRAINT oauth_clients_logo_uri_length CHECK (char_length(logo_uri) <= 2048),
+    CONSTRAINT oauth_clients_token_endpoint_auth_method_check CHECK (token_endpoint_auth_method IN ('client_secret_basic', 'client_secret_post', 'none'))
 );
 
 CREATE INDEX IF NOT EXISTS oauth_clients_deleted_at_idx ON auth.oauth_clients (deleted_at);
