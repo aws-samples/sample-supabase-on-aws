@@ -678,6 +678,9 @@ func (a *API) loadExternalStateFromJWT(ctx context.Context, db *storage.Connecti
 // Provider returns a Provider interface for the given name.
 func (a *API) Provider(ctx context.Context, name string, scopes string) (provider.Provider, conf.OAuthProviderConfiguration, error) {
 	config := a.config
+	// In multi-tenant mode, per-tenant external provider credentials (delivered
+	// by tenant-manager) override the global config for the current request.
+	ext := tenant.ResolveExternalConfig(ctx, config.External)
 	name = strings.ToLower(name)
 
 	var err error
@@ -713,7 +716,7 @@ func (a *API) Provider(ctx context.Context, name string, scopes string) (provide
 		pConfig = config.External.Gitlab
 		p, err = provider.NewGitlabProvider(pConfig, scopes)
 	case "google":
-		pConfig = config.External.Google
+		pConfig = ext.Google
 		p, err = provider.NewGoogleProvider(ctx, pConfig, scopes)
 	case "kakao":
 		pConfig = config.External.Kakao

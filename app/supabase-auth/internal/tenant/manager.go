@@ -36,6 +36,9 @@ type tenantData struct {
 	Ref            string `json:"ref"`
 	JWTSecret      string `json:"jwt_secret"`
 	ServiceRoleKey string `json:"service_role_key"`
+	// External carries per-tenant social/OAuth provider config (e.g. google).
+	// nil when the tenant has no external providers configured.
+	External *conf.ProviderConfiguration `json:"external"`
 }
 
 // cacheEntry holds a cached tenant config with expiration
@@ -46,17 +49,17 @@ type cacheEntry struct {
 
 // Manager handles tenant configuration retrieval and caching
 type Manager struct {
-	config       *conf.MultiTenantConfiguration
+	config        *conf.MultiTenantConfiguration
 	baseJWTConfig *conf.JWTConfiguration // global JWT config used as base for tenant configs
-	httpClient   *http.Client
-	cache        map[string]*cacheEntry
-	cacheMu      sync.RWMutex
+	httpClient    *http.Client
+	cache         map[string]*cacheEntry
+	cacheMu       sync.RWMutex
 }
 
 // NewManager creates a new tenant manager.
 func NewManager(config *conf.MultiTenantConfiguration, baseJWTConfig *conf.JWTConfiguration) *Manager {
 	return &Manager{
-		config:       config,
+		config:        config,
 		baseJWTConfig: baseJWTConfig,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
@@ -146,6 +149,7 @@ func (m *Manager) fetchTenantConfig(ctx context.Context, tenantID string) (*Tena
 		TenantID:    tenantID,
 		DatabaseURL: databaseURL,
 		JWTSecret:   tmResp.Data.JWTSecret,
+		External:    tmResp.Data.External,
 	}
 
 	// Pre-build JWT configuration with tenant secret for signing/verification

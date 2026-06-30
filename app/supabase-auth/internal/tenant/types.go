@@ -12,6 +12,7 @@ type TenantConfig struct {
 	JWTSecret   string
 	JWTConfig   *conf.JWTConfiguration // pre-built JWT config with Keys for signing/verification
 	SiteURL     string
+	External    *conf.ProviderConfiguration // per-tenant external OAuth provider config (nil when not configured)
 }
 
 // TenantContext holds the tenant-specific context for a request

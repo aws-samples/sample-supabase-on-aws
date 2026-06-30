@@ -1,6 +1,10 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/supabase/auth/internal/tenant"
+)
 
 type ProviderSettings struct {
 	AnonymousUsers bool `json:"anonymous_users"`
@@ -42,6 +46,9 @@ type Settings struct {
 
 func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 	config := a.config
+	// In multi-tenant mode, report the tenant's enabled providers so a tenant
+	// without Google configured does not advertise it.
+	ext := tenant.ResolveExternalConfig(r.Context(), config.External)
 
 	return sendJSON(w, http.StatusOK, &Settings{
 		ExternalProviders: ProviderSettings{
@@ -56,7 +63,7 @@ func (a *API) Settings(w http.ResponseWriter, r *http.Request) error {
 			Fly:            config.External.Fly.Enabled,
 			GitHub:         config.External.Github.Enabled,
 			GitLab:         config.External.Gitlab.Enabled,
-			Google:         config.External.Google.Enabled,
+			Google:         ext.Google.Enabled,
 			Kakao:          config.External.Kakao.Enabled,
 			Keycloak:       config.External.Keycloak.Enabled,
 			Linkedin:       config.External.Linkedin.Enabled,

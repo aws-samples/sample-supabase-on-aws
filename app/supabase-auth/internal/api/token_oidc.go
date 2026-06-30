@@ -16,6 +16,7 @@ import (
 	"github.com/supabase/auth/internal/models"
 	"github.com/supabase/auth/internal/observability"
 	"github.com/supabase/auth/internal/storage"
+	"github.com/supabase/auth/internal/tenant"
 )
 
 // IdTokenGrantParams are the parameters the IdTokenGrant method accepts
@@ -31,6 +32,10 @@ type IdTokenGrantParams struct {
 
 func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.GlobalConfiguration, r *http.Request) (*oidc.Provider, bool, string, []string, bool, error) {
 	log := observability.GetLogEntry(r).Entry
+
+	// In multi-tenant mode, per-tenant external provider credentials override
+	// the global config for the current request (id_token / One Tap flow).
+	ext := tenant.ResolveExternalConfig(ctx, config.External)
 
 	var cfg *conf.OAuthProviderConfiguration
 	var issuer string
@@ -67,10 +72,10 @@ func (p *IdTokenGrantParams) getProvider(ctx context.Context, config *conf.Globa
 		}
 
 	case p.Provider == "google" || p.Issuer == provider.IssuerGoogle:
-		cfg = &config.External.Google
+		cfg = &ext.Google
 		providerType = "google"
 		issuer = provider.IssuerGoogle
-		acceptableClientIDs = append(acceptableClientIDs, config.External.Google.ClientID...)
+		acceptableClientIDs = append(acceptableClientIDs, ext.Google.ClientID...)
 
 	case p.Provider == "azure" || provider.IsAzureIssuer(p.Issuer):
 		detectedIssuer, err := provider.DetectAzureIDTokenIssuer(ctx, p.IdToken)
