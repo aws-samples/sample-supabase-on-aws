@@ -1,8 +1,14 @@
 import { ERRORS, ErrorCode, StorageBackendError } from '@internal/errors'
 import { Sharder } from '@internal/sharding'
 import { ICEBERG_BUCKET_RESERVED_SUFFIX } from '@storage/limits'
-import { IcebergError } from '@storage/protocols/iceberg/catalog/errors'
-import { Metastore } from '../knex'
+import {
+  createAlreadyExistsError,
+  createNoSuchNamespaceError,
+  createNoSuchTableError,
+  IcebergError,
+  IcebergHttpStatusCode,
+} from '@storage/protocols/iceberg/catalog/errors'
+import { Metastore } from '../metastore'
 import {
   CatalogAuthType,
   CommitTableRequest,
@@ -44,6 +50,40 @@ interface FindTableByIdParams {
   id: string
   tenantId: string
   namespaceId: string
+}
+
+function isMetastoreNoSuchKeyError(error: unknown) {
+  return error instanceof StorageBackendError && error.code === ErrorCode.NoSuchKey
+}
+
+async function findNamespaceByNameOrThrow(
+  metastore: Pick<Metastore, 'findNamespaceByName'>,
+  params: Parameters<Metastore['findNamespaceByName']>[0]
+) {
+  try {
+    return await metastore.findNamespaceByName(params)
+  } catch (error) {
+    if (isMetastoreNoSuchKeyError(error)) {
+      throw createNoSuchNamespaceError('Namespace not found')
+    }
+
+    throw error
+  }
+}
+
+async function findTableByNameOrThrow(
+  metastore: Pick<Metastore, 'findTableByName'>,
+  params: Parameters<Metastore['findTableByName']>[0]
+) {
+  try {
+    return await metastore.findTableByName(params)
+  } catch (error) {
+    if (isMetastoreNoSuchKeyError(error)) {
+      throw createNoSuchTableError('Table not found')
+    }
+
+    throw error
+  }
 }
 
 /**
@@ -144,7 +184,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
         name: table.warehouse,
       })
 
-      const dbNamespace = await store.findNamespaceByName({
+      const dbNamespace = await findNamespaceByNameOrThrow(store, {
         name: namespace,
         tenantId: this.tenantId,
         catalogId: catalog.id,
@@ -157,7 +197,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
           tenantId: this.tenantId,
         })
 
-        throw ERRORS.ResourceAlreadyExists()
+        throw createAlreadyExistsError('Table already exists')
       } catch (e) {
         if (!(e instanceof StorageBackendError && e.code === ErrorCode.NoSuchKey)) {
           throw e
@@ -188,54 +228,50 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       })
 
       try {
-        try {
-          await super.createNamespace({
-            namespace: [namespaceName],
-            warehouse: shardKey,
-            // Note: Underline catalog doesn't support this
-            // properties: {
-            //   ...(dbNamespace.metadata ? dbNamespace.metadata : {}),
-            //   'bucket-name': catalog.name,
-            //   'tenant-id': this.tenantId,
-            // },
-          })
-        } catch (e) {
-          if (e instanceof IcebergError && e.code === 409) {
-            // Namespace already exists, ignore
-          } else {
-            throw e
-          }
-        }
-
-        const icebergTable = await super.createTable({
-          ...table,
+        await super.createNamespace({
+          namespace: [namespaceName],
           warehouse: shardKey,
-          namespace: namespaceName,
+          // Note: Underline catalog doesn't support this
+          // properties: {
+          //   ...(dbNamespace.metadata ? dbNamespace.metadata : {}),
+          //   'bucket-name': catalog.name,
+          //   'tenant-id': this.tenantId,
+          // },
         })
-
-        await store.createTable({
-          name: table.name,
-          bucketId: catalog.id,
-          bucketName: catalog.name,
-          namespaceId: dbNamespace.id,
-          tenantId: this.options.tenantId,
-          location: icebergTable['metadata'].location as string,
-          shardKey,
-          shardId,
-          remoteTableId: icebergTable['metadata']['table-uuid'],
-        })
-
-        await sharder.confirm(reservationId, {
-          logicalName: `${dbNamespace.id}/${table.name}`,
-          tenantId: this.tenantId,
-          kind: 'iceberg-table',
-          bucketName: catalog.id,
-        })
-
-        return icebergTable
       } catch (e) {
-        throw e
+        if (e instanceof IcebergError && e.code === IcebergHttpStatusCode.Conflict) {
+          // Namespace already exists, ignore
+        } else {
+          throw e
+        }
       }
+
+      const icebergTable = await super.createTable({
+        ...table,
+        warehouse: shardKey,
+        namespace: namespaceName,
+      })
+
+      await store.createTable({
+        name: table.name,
+        bucketId: catalog.id,
+        bucketName: catalog.name,
+        namespaceId: dbNamespace.id,
+        tenantId: this.options.tenantId,
+        location: icebergTable['metadata'].location as string,
+        shardKey,
+        shardId,
+        remoteTableId: icebergTable['metadata']['table-uuid'],
+      })
+
+      await sharder.confirm(reservationId, {
+        logicalName: `${dbNamespace.id}/${table.name}`,
+        tenantId: this.tenantId,
+        kind: 'iceberg-table',
+        bucketName: catalog.id,
+      })
+
+      return icebergTable
     })
   }
 
@@ -254,7 +290,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       name: params.warehouse,
     })
 
-    const dbNamespace = await this.findNamespaceByName({
+    const dbNamespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       name: params.namespace,
       tenantId: this.tenantId,
       catalogId: catalog.id,
@@ -294,13 +330,13 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       name: params.warehouse,
     })
 
-    const namespace = await this.options.metastore.findNamespaceByName({
+    const namespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.namespace,
       catalogId: catalog.id,
     })
 
-    const dbTable = await this.options.metastore.findTableByName({
+    const dbTable = await findTableByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.table,
       namespaceId: namespace.id,
@@ -336,13 +372,13 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
         name: params.warehouse,
       })
 
-      const namespace = await this.options.metastore.findNamespaceByName({
+      const namespace = await findNamespaceByNameOrThrow(store, {
         tenantId: this.tenantId,
         name: params.namespace,
         catalogId: catalog.id,
       })
 
-      const dbTable = await this.options.metastore.findTableByName({
+      const dbTable = await findTableByNameOrThrow(store, {
         tenantId: this.tenantId,
         name: params.table,
         namespaceId: namespace.id,
@@ -363,26 +399,27 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
   }
 
   /**
-   * Checks if a table exists in the specified namespace for the current tenant
+   * Asserts that a table exists in the specified namespace for the current tenant
    *
    * Maps the tenant's namespace to an internal representation before checking.
    *
    * @param params Table exists request parameters
-   * @returns Boolean indicating if the table exists
+   * @returns Resolves with no body when the table exists
+   * @throws NoSuchTableException when the table is missing
    */
-  async tableExists(params: TableExistsRequest) {
+  async tableExists(params: TableExistsRequest): Promise<void> {
     const catalog = await this.findCatalogByName({
       tenantId: this.tenantId,
       name: params.warehouse,
     })
 
-    const namespace = await this.options.metastore.findNamespaceByName({
+    const namespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.namespace,
       catalogId: catalog.id,
     })
 
-    const dbTable = await this.options.metastore.findTableByName({
+    const dbTable = await findTableByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.table,
       namespaceId: namespace.id,
@@ -402,20 +439,21 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
   }
 
   /**
-   * Checks if a namespace exists for the current tenant
+   * Asserts that a namespace exists for the current tenant
    *
    * Maps the tenant's namespace to an internal representation before checking.
    *
    * @param params Namespace exists request parameters
-   * @returns Boolean indicating if the namespace exists
+   * @returns Resolves with no body when the namespace exists
+   * @throws NoSuchNamespaceException when the namespace is missing
    */
-  async namespaceExists(params: NamespaceExistsRequest) {
+  async namespaceExists(params: NamespaceExistsRequest): Promise<void> {
     const catalog = await this.findCatalogByName({
       tenantId: this.tenantId,
       name: params.warehouse,
     })
 
-    await this.options.metastore.findNamespaceByName({
+    await findNamespaceByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.namespace,
       catalogId: catalog.id,
@@ -459,7 +497,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
         tenantId: this.options.tenantId,
       })
 
-      return { namespace: [namespace.name], properties: params.properties || {} }
+      return { namespace: [namespace.name], properties: namespace.metadata || {} }
     })
   }
 
@@ -477,7 +515,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       name: params.warehouse,
     })
 
-    const namespace = await this.findNamespaceByName({
+    const namespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       name: params.namespace,
       tenantId: this.tenantId,
       catalogId: catalog.id,
@@ -515,13 +553,13 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       name: params.warehouse,
     })
 
-    const namespace = await this.options.metastore.findNamespaceByName({
+    const namespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.namespace,
       catalogId: catalog.id,
     })
 
-    const dbTable = await this.options.metastore.findTableByName({
+    const dbTable = await findTableByNameOrThrow(this.options.metastore, {
       tenantId: this.tenantId,
       name: params.table,
       namespaceId: namespace.id,
@@ -589,7 +627,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
       name: params.warehouse,
     })
 
-    const namespace = await this.findNamespaceByName({
+    const namespace = await findNamespaceByNameOrThrow(this.options.metastore, {
       name: params.namespace,
       tenantId: this.tenantId,
       catalogId: catalog.id,
@@ -680,7 +718,7 @@ export class TenantAwareRestCatalog extends RestCatalogClient {
 
     if (namespace.endsWith('--s3-table')) {
       throw ERRORS.InvalidParameter('namespace', {
-        message: 'Resource name must not end with the reserved suffix "--iceberg"',
+        message: 'Resource name must not end with the reserved suffix "--s3-table"',
       })
     }
 

@@ -1,33 +1,32 @@
 import {
+  calculateMaxCacheSizeBytes,
+  createConstantSizeCalculation,
   createLruCache,
   DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
   TENANT_CONFIG_CACHE_NAME,
 } from '@internal/cache'
-import { TenantConnection } from '@internal/database/connection'
 import { lastLocalMigrationName } from '@internal/database/migrations/files'
 import { ERRORS } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
 import {
   S3CredentialsManager,
-  S3CredentialsManagerStoreKnex,
+  S3CredentialsManagerStorePg,
 } from '@storage/protocols/s3/credentials'
 import { JWTPayload } from 'jose'
-import objectSizeOf from 'object-sizeof'
 import { getConfig, JwksConfig, JwksConfigKey, JwksConfigKeyOCT } from '../../config'
 import { decrypt } from '../auth'
-import { JWKSManager, JWKSManagerStoreKnex } from '../auth/jwks'
+import { JWKSManager, JWKSManagerStorePg } from '../auth/jwks'
 import { createMutexByKey } from '../concurrency'
-import { PubSubAdapter } from '../pubsub'
+import { isStringMessage, PubSubAdapter } from '../pubsub'
 import { DBMigration } from './migrations/types'
-import { multitenantKnex } from './multitenant-db'
-
-type DBPoolMode = 'single_use' | 'recycled'
+import { multitenantPgExecutor } from './multitenant-pg'
+import { PgTenantConnection } from './pg-connection'
+import { TenantConfigStorePg } from './tenant-store-pg'
 
 interface TenantConfig {
   anonKey?: string
   databaseUrl: string
   databasePoolUrl?: string
-  databasePoolMode?: DBPoolMode
   maxConnections?: number
   fileSizeLimit: number
   features: Features
@@ -37,6 +36,7 @@ interface TenantConfig {
   serviceKeyPayload: {
     role: string
   }
+  deleteObjectsLimit?: number
   migrationVersion?: keyof typeof DBMigration
   migrationStatus?: TenantMigrationStatus
   syncMigrationsDone?: boolean
@@ -58,7 +58,7 @@ export interface Features {
   }
   imageTransformation: {
     enabled: boolean
-    maxResolution?: number
+    maxResolution?: number | null
   }
   s3Protocol: {
     enabled: boolean
@@ -80,24 +80,24 @@ export enum TenantMigrationStatus {
   FAILED_STALE = 'FAILED_STALE',
 }
 
-const {
-  isMultitenant,
-  dbServiceRole,
-  dbMigrationFreezeAt,
-  icebergEnabled,
-  vectorEnabled,
-  multitenantDatabaseQueryTimeout,
-} = getConfig()
+const { isMultitenant, dbServiceRole, dbMigrationFreezeAt, databaseMaxConnections } = getConfig()
 
+// Max 16,384 items. At ~2KB per config, this uses roughly ~32MB of heap memory worst-case.
 export const TENANT_CONFIG_CACHE_MAX_ITEMS = 16384
-export const TENANT_CONFIG_CACHE_MAX_SIZE_BYTES = 1024 * 1024 * 50 // 50 MiB
+export const TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES = 2 * 1024
+export const TENANT_CONFIG_CACHE_MAX_SIZE_BYTES = calculateMaxCacheSizeBytes(
+  TENANT_CONFIG_CACHE_MAX_ITEMS,
+  TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES
+)
 export const TENANT_CONFIG_CACHE_TTL_MS = 1000 * 60 * 60 // 1h
 
 const tenantConfigCache = createLruCache<string, TenantConfig>(TENANT_CONFIG_CACHE_NAME, {
   max: TENANT_CONFIG_CACHE_MAX_ITEMS,
   maxSize: TENANT_CONFIG_CACHE_MAX_SIZE_BYTES,
   ttl: TENANT_CONFIG_CACHE_TTL_MS,
-  sizeCalculation: (value) => objectSizeOf(value),
+  sizeCalculation: createConstantSizeCalculation<TenantConfig, string>(
+    TENANT_CONFIG_CACHE_ESTIMATED_ENTRY_SIZE_BYTES
+  ),
   updateAgeOnGet: true,
   allowStale: false,
   purgeStaleIntervalMs: DEFAULT_CACHE_PURGE_STALE_INTERVAL_MS,
@@ -105,11 +105,13 @@ const tenantConfigCache = createLruCache<string, TenantConfig>(TENANT_CONFIG_CAC
 
 const tenantMutex = createMutexByKey<TenantConfig>()
 
-export const jwksManager = new JWKSManager(new JWKSManagerStoreKnex(multitenantKnex))
+export const jwksManager = new JWKSManager(new JWKSManagerStorePg(multitenantPgExecutor))
 
 export const s3CredentialsManager = new S3CredentialsManager(
-  new S3CredentialsManagerStoreKnex(multitenantKnex)
+  new S3CredentialsManagerStorePg(multitenantPgExecutor)
 )
+
+const tenantConfigStorePg = new TenantConfigStorePg(multitenantPgExecutor)
 
 // Cache merged legacy JWKS objects by the active + legacy config object identities
 // so repeated reads reuse a stable merged object without mutating either input.
@@ -202,11 +204,7 @@ export async function getTenantConfig(
       return cachedConfig
     }
 
-    const tenant = await multitenantKnex
-      .table('tenants')
-      .first()
-      .where('id', tenantId)
-      .abortOnSignal(AbortSignal.timeout(multitenantDatabaseQueryTimeout))
+    const tenant = await getTenantConfigRow(tenantId)
 
     if (!tenant) {
       throw ERRORS.MissingTenantConfig(tenantId)
@@ -214,7 +212,6 @@ export async function getTenantConfig(
     const {
       anon_key,
       database_url,
-      database_pool_mode,
       file_size_limit,
       jwt_secret,
       jwks,
@@ -232,6 +229,7 @@ export async function getTenantConfig(
       image_transformation_max_resolution,
       database_pool_url,
       max_connections,
+      delete_objects_limit,
       migrations_version,
       migrations_status,
       tracing_mode,
@@ -245,46 +243,55 @@ export async function getTenantConfig(
       anonKey: decrypt(anon_key),
       databaseUrl: decrypt(database_url),
       databasePoolUrl: database_pool_url ? decrypt(database_pool_url) : undefined,
-      databasePoolMode: database_pool_mode,
       fileSizeLimit: Number(file_size_limit),
       jwtSecret,
-      jwks,
+      jwks: jwks ? { keys: jwks.keys ?? [] } : jwks,
       serviceKey,
       serviceKeyPayload: { role: dbServiceRole },
       maxConnections: max_connections ? Number(max_connections) : undefined,
+      deleteObjectsLimit:
+        delete_objects_limit === null ||
+        delete_objects_limit === undefined ||
+        delete_objects_limit <= 0
+          ? undefined
+          : Number(delete_objects_limit),
       features: {
         imageTransformation: {
-          enabled: feature_image_transformation,
+          enabled: Boolean(feature_image_transformation),
           maxResolution: image_transformation_max_resolution,
         },
         s3Protocol: {
-          enabled: feature_s3_protocol,
+          enabled: Boolean(feature_s3_protocol),
         },
         purgeCache: {
-          enabled: feature_purge_cache,
+          enabled: Boolean(feature_purge_cache),
         },
         icebergCatalog: {
-          enabled: icebergEnabled || feature_iceberg_catalog,
-          maxNamespaces: feature_iceberg_catalog_max_namespaces,
-          maxTables: feature_iceberg_catalog_max_tables,
-          maxCatalogs: feature_iceberg_catalog_max_catalogs,
+          enabled: Boolean(feature_iceberg_catalog),
+          maxNamespaces: feature_iceberg_catalog_max_namespaces ?? 0,
+          maxTables: feature_iceberg_catalog_max_tables ?? 0,
+          maxCatalogs: feature_iceberg_catalog_max_catalogs ?? 0,
         },
         vectorBuckets: {
-          enabled: vectorEnabled || feature_vector_buckets,
-          maxBuckets: feature_vector_buckets_max_buckets,
-          maxIndexes: feature_vector_buckets_max_indexes,
+          enabled: Boolean(feature_vector_buckets),
+          maxBuckets: feature_vector_buckets_max_buckets ?? 0,
+          maxIndexes: feature_vector_buckets_max_indexes ?? 0,
         },
       },
-      migrationVersion: migrations_version,
-      migrationStatus: migrations_status,
+      migrationVersion: migrations_version as keyof typeof DBMigration | undefined,
+      migrationStatus: migrations_status as TenantMigrationStatus | undefined,
       migrationsRun: false,
-      tracingMode: tracing_mode,
-      disableEvents: disable_events,
+      tracingMode: tracing_mode ?? undefined,
+      disableEvents: disable_events ?? undefined,
     }
     tenantConfigCache.set(tenantId, config)
 
     return config
   })
+}
+
+function getTenantConfigRow(tenantId: string) {
+  return tenantConfigStorePg.findById(tenantId)
 }
 
 export async function getServiceKeyUser(tenantId: string) {
@@ -392,6 +399,16 @@ export async function getFileSizeLimit(tenantId: string): Promise<number> {
 }
 
 /**
+ * Get the maximum objects allowed per bulk object request for a tenant.
+ * Undefined means the tenant uses the service default.
+ * @param tenantId
+ */
+export async function getDeleteObjectsLimit(tenantId: string): Promise<number | undefined> {
+  const { deleteObjectsLimit } = await getTenantConfig(tenantId)
+  return deleteObjectsLimit
+}
+
+/**
  * Get features flags config for a specific tenant
  * @param tenantId
  */
@@ -406,7 +423,13 @@ const TENANTS_UPDATE_CHANNEL = 'tenants_update'
  * Keeps the in memory config cache up to date
  */
 export async function listenForTenantUpdate(pubSub: PubSubAdapter): Promise<void> {
-  await pubSub.subscribe(TENANTS_UPDATE_CHANNEL, onTenantConfigChange)
+  await pubSub.subscribe(TENANTS_UPDATE_CHANNEL, (cacheKey) => {
+    if (!isStringMessage(cacheKey)) {
+      return
+    }
+
+    void onTenantConfigChange(cacheKey)
+  })
   await s3CredentialsManager.listenForTenantUpdate(pubSub)
   await jwksManager.listenForTenantUpdate(pubSub)
 }
@@ -415,7 +438,7 @@ export async function listenForTenantUpdate(pubSub: PubSubAdapter): Promise<void
  * Handles the tenant config change event
  * @param cacheKey
  */
-async function onTenantConfigChange(cacheKey: string) {
+export async function onTenantConfigChange(cacheKey: string) {
   const oldConfig = tenantConfigCache.get(cacheKey, { recordMetrics: false })
   tenantConfigCache.delete(cacheKey)
 
@@ -426,21 +449,25 @@ async function onTenantConfigChange(cacheKey: string) {
   try {
     const newConfig = await getTenantConfig(cacheKey, { recordMetrics: false })
 
-    if (newConfig.databasePoolMode === 'single_use' && oldConfig.databasePoolMode === 'recycled') {
-      // if the pool mode changed to single use, we need destroy the current pool
-      return TenantConnection.poolManager.destroy(cacheKey).catch((e) => {
-        logSchema.error(logger, 'Error destroying the pool', {
-          type: 'pool',
-          error: e as Error,
-          project: cacheKey,
-        })
-      })
+    // 1. DB endpoint changed: the cached pool's connection string is stale, and
+    //    so are its open sockets. Hard destroy so the next request rebuilds
+    //    against the new endpoint.
+    if (
+      newConfig.databaseUrl !== oldConfig.databaseUrl ||
+      newConfig.databasePoolUrl !== oldConfig.databasePoolUrl
+    ) {
+      return destroyTenantPool(cacheKey)
     }
 
-    // Rebalance the pool if the max connections changed
-    if (newConfig.maxConnections && newConfig.maxConnections !== oldConfig.maxConnections) {
-      TenantConnection.poolManager.rebalance(cacheKey, {
-        clusterSize: newConfig.maxConnections,
+    // 2. Max connections changed: endpoint is fine, only the budget moved.
+    //    Rebalance the cached pg pool in place so new acquire attempts observe
+    //    the new budget while in-flight queries keep their checked-out clients.
+    if (
+      normalizeMaxConnections(newConfig.maxConnections) !==
+      normalizeMaxConnections(oldConfig.maxConnections)
+    ) {
+      PgTenantConnection.poolManager.rebalance(cacheKey, {
+        maxConnections: resolveMaxConnections(newConfig.maxConnections),
       })
     }
   } catch {
@@ -449,4 +476,26 @@ async function onTenantConfigChange(cacheKey: string) {
     // or if the tenant was updated and the cache was invalidated
     // before we could get the new config
   }
+}
+
+function normalizeMaxConnections(maxConnections: number | null | undefined): number | null {
+  return maxConnections ?? null
+}
+
+function resolveMaxConnections(maxConnections: number | null | undefined): number {
+  return maxConnections ?? databaseMaxConnections
+}
+
+async function destroyTenantPool(cacheKey: string): Promise<void> {
+  await Promise.allSettled([PgTenantConnection.poolManager.destroy(cacheKey)]).then((results) => {
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        logSchema.error(logger, 'Error destroying the pool', {
+          type: 'pool',
+          error: result.reason as Error,
+          project: cacheKey,
+        })
+      }
+    }
+  })
 }

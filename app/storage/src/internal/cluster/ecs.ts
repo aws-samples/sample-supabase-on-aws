@@ -1,9 +1,13 @@
 import { ECSClient, ListTasksCommand } from '@aws-sdk/client-ecs'
-import { DesiredStatus } from '@aws-sdk/client-ecs/dist-types/models/enums'
-import axios from 'axios'
+
+type ECSTaskMetadata = {
+  Cluster: string
+  Family: string
+}
 
 export class ClusterDiscoveryECS {
   private client: ECSClient
+  private taskMetadata?: Promise<ECSTaskMetadata>
 
   constructor() {
     this.client = new ECSClient()
@@ -14,21 +18,40 @@ export class ClusterDiscoveryECS {
       throw new Error('ECS_CONTAINER_METADATA_URI is not set')
     }
 
-    const [running, pending] = await Promise.all([
-      this.listTasks('RUNNING'),
-      this.listTasks('PENDING'),
-    ])
+    const metadata = await this.getCachedTaskMetadata(process.env.ECS_CONTAINER_METADATA_URI)
 
-    return running + pending
+    return await this.listTasks(metadata)
   }
 
-  private async listTasks(status: DesiredStatus) {
-    const respMetadata = await axios.get(`${process.env.ECS_CONTAINER_METADATA_URI}/task`)
+  private async getTaskMetadata(metadataUri: string): Promise<ECSTaskMetadata> {
+    const metadataUrl = `${metadataUri}/task`
+    const response = await fetch(metadataUrl)
 
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined)
+      const statusText = response.statusText ? ` ${response.statusText}` : ''
+      throw new Error(
+        `Request failed with status code ${response.status}${statusText} fetching ECS task metadata from ${metadataUrl}`
+      )
+    }
+
+    return (await response.json()) as ECSTaskMetadata
+  }
+
+  private getCachedTaskMetadata(metadataUri: string): Promise<ECSTaskMetadata> {
+    this.taskMetadata ??= this.getTaskMetadata(metadataUri).catch((error) => {
+      this.taskMetadata = undefined
+      throw error
+    })
+
+    return this.taskMetadata
+  }
+
+  private async listTasks(metadata: ECSTaskMetadata) {
     const command = new ListTasksCommand({
-      family: respMetadata.data.Family,
-      cluster: respMetadata.data.Cluster,
-      desiredStatus: status,
+      family: metadata.Family,
+      cluster: metadata.Cluster,
+      desiredStatus: 'RUNNING',
     })
     const response = await this.client.send(command)
     return response.taskArns?.length || 0

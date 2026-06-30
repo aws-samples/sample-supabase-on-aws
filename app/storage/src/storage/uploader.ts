@@ -1,6 +1,6 @@
 import { ERRORS, StorageBackendError } from '@internal/errors'
 import { logger, logSchema } from '@internal/monitoring'
-import { fileUploadedSuccess, fileUploadStarted } from '@internal/monitoring/metrics'
+import { recordUploadStarted, recordUploadSuccess } from '@internal/monitoring/metrics'
 import { StorageObjectLocator } from '@storage/locator'
 import { randomUUID } from 'crypto'
 import { FastifyRequest } from 'fastify'
@@ -13,6 +13,8 @@ import { getFileSizeLimit, isEmptyFolder } from './limits'
 import { validateXRobotsTag } from './validators/x-robots-tag'
 
 const { storageS3Bucket, uploadFileSizeLimitStandard } = getConfig()
+
+type UploadType = 'standard' | 's3' | 'resumable'
 
 interface FileUpload {
   body: Readable
@@ -31,7 +33,7 @@ export interface UploadRequest {
   userMetadata?: Record<string, unknown>
   owner?: string
   isUpsert?: boolean
-  uploadType?: 'standard' | 's3' | 'resumable'
+  uploadType: UploadType
   signal?: AbortSignal
 }
 
@@ -100,12 +102,9 @@ export class Uploader {
    * We check RLS policies before proceeding
    * @param options
    */
-  async prepareUpload(options: CanUploadOptions & { uploadType?: string }) {
+  async prepareUpload(options: CanUploadOptions & { uploadType: UploadType }) {
     await this.canUpload(options)
-    fileUploadStarted.add(1, {
-      uploadType: options.uploadType,
-      tenantId: this.db.tenantId,
-    })
+    recordUploadStarted(options.uploadType)
 
     return randomUUID()
   }
@@ -170,6 +169,7 @@ export class Uploader {
         tenant: this.db.tenant(),
         version,
         reqId: this.db.reqId,
+        sbReqId: this.db.sbReqId,
       })
       throw shouldCloseConnectionAfterResponse(file.body) ? withConnectionClose(e) : e
     }
@@ -199,7 +199,6 @@ export class Uploader {
     objectMetadata: ObjectMetadata
     version: string
     emitEvent?: boolean
-    uploadType?: 'standard' | 's3' | 'resumable'
     userMetadata?: Record<string, unknown>
   }) {
     try {
@@ -219,7 +218,7 @@ export class Uploader {
           dontErrorOnEmpty: true,
         })
 
-        const isNew = !Boolean(currentObj)
+        const isNew = !currentObj
 
         // update object
         const newObject = await db.upsertObject({
@@ -242,6 +241,7 @@ export class Uploader {
               tenant: this.db.tenant(),
               version: currentObj.version,
               reqId: this.db.reqId,
+              sbReqId: this.db.sbReqId,
             })
           )
         }
@@ -257,6 +257,7 @@ export class Uploader {
               bucketId,
               metadata: objectMetadata,
               reqId: this.db.reqId,
+              sbReqId: this.db.sbReqId,
               uploadType,
             })
             .catch((e) => {
@@ -264,6 +265,7 @@ export class Uploader {
                 type: 'event',
                 error: e,
                 project: this.db.tenantId,
+                sbReqId: this.db.sbReqId,
                 metadata: JSON.stringify({
                   name: objectName,
                   bucketId,
@@ -277,10 +279,7 @@ export class Uploader {
 
         await Promise.all(events)
 
-        fileUploadedSuccess.add(1, {
-          uploadType,
-          tenantId: this.db.tenantId,
-        })
+        recordUploadSuccess(uploadType)
 
         return { obj: newObject, isNew, metadata: objectMetadata }
       })
@@ -291,6 +290,7 @@ export class Uploader {
         tenant: this.db.tenant(),
         version,
         reqId: this.db.reqId,
+        sbReqId: this.db.sbReqId,
       })
       throw e
     }
@@ -498,6 +498,9 @@ export async function fileUploadFromRequest(
         }
       }
     } catch (e) {
+      if (e instanceof StorageBackendError) {
+        throw e
+      }
       throw ERRORS.NoContentProvided(e as Error)
     }
   } else {

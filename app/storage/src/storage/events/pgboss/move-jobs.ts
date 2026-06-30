@@ -1,6 +1,6 @@
-import { multitenantKnex } from '@internal/database'
+import { multitenantPgExecutor, PgTransaction } from '@internal/database'
 import { logger, logSchema } from '@internal/monitoring'
-import { BasePayload, PG_BOSS_SCHEMA, Queue } from '@internal/queue'
+import { BasePayload, PG_BOSS_SCHEMA, Queue, SYSTEM_TENANT_REF } from '@internal/queue'
 import { Job, Queue as PgBossQueue, SendOptions, WorkOptions } from 'pg-boss'
 import { BaseEvent } from '../base-event'
 
@@ -38,9 +38,17 @@ export class MoveJobs extends BaseEvent<MoveJobsPayload> {
   }
 
   static async handle(job: Job<MoveJobsPayload>) {
-    await multitenantKnex.transaction(async (tnx) => {
-      const resultLock = await tnx.raw('SELECT pg_try_advisory_xact_lock(-5525285245963000611)')
-      const lockAcquired = resultLock.rows.shift()?.pg_try_advisory_xact_lock || false
+    return this.handlePg(job)
+  }
+
+  private static async handlePg(job: Job<MoveJobsPayload>) {
+    const { sbReqId } = job.data
+
+    await withPgTransaction(async (tnx) => {
+      const resultLock = await tnx.query<{ locked: boolean }>(
+        `SELECT pg_try_advisory_xact_lock(-5525285245963000611) AS locked`
+      )
+      const lockAcquired = resultLock.rows.shift()?.locked || false
 
       if (!lockAcquired) {
         return
@@ -53,12 +61,15 @@ export class MoveJobs extends BaseEvent<MoveJobsPayload> {
       if (!toQueue) {
         logSchema.error(logger, `[PgBoss] Target queue ${job.data.toQueue} does not exist`, {
           type: 'pgboss',
+          project: job.data.tenant?.ref || SYSTEM_TENANT_REF,
+          sbReqId,
         })
         return
       }
 
       try {
-        const sql = `
+        await tnx.query({
+          text: `
             INSERT INTO ${schema}.job (
                 id,
                 name,
@@ -80,7 +91,7 @@ export class MoveJobs extends BaseEvent<MoveJobsPayload> {
             )
             SELECT
                 id,
-                ? as name,
+                $1 as name,
                 priority,
                 data,
                 retry_limit,
@@ -94,30 +105,55 @@ export class MoveJobs extends BaseEvent<MoveJobsPayload> {
                 created_on,
                 keep_until,
                 output,
-                ? as policy,
+                $2 as policy,
                 'created' as state
             FROM ${schema}.job
-            WHERE name = ?
+            WHERE name = $3
                 AND state IN ('created', 'active', 'retry')
             ON CONFLICT DO NOTHING
-        `
-
-        await tnx.raw(sql, [toQueue.name, toQueue.policy, fromQueueName])
+          `,
+          values: [toQueue.name, toQueue.policy, fromQueueName],
+        })
 
         if (job.data.deleteJobsFromOriginalQueue) {
-          const deleteSql = `
-                DELETE FROM ${schema}.job
-                WHERE name = ?
-                    AND state IN ('created', 'active', 'retry')
-            `
-          await tnx.raw(deleteSql, [fromQueueName])
+          await tnx.query({
+            text: `
+              DELETE FROM ${schema}.job
+              WHERE name = $1
+                AND state IN ('created', 'active', 'retry')
+            `,
+            values: [fromQueueName],
+          })
         }
       } catch (error) {
         logSchema.error(logger, '[PgBoss] Error while copying jobs', {
           type: 'pgboss',
           error,
+          project: job.data.tenant?.ref || SYSTEM_TENANT_REF,
+          sbReqId,
         })
       }
     })
+  }
+}
+
+async function withPgTransaction<T>(fn: (tnx: PgTransaction) => Promise<T>): Promise<T> {
+  const tnx = await multitenantPgExecutor.beginTransaction()
+
+  try {
+    const result = await fn(tnx)
+    await tnx.commit()
+    return result
+  } catch (e) {
+    try {
+      await tnx.rollback()
+    } catch (rollbackError) {
+      logSchema.warning(logger, '[MoveJobs] Failed to rollback transaction', {
+        type: 'pgboss',
+        error: rollbackError,
+        metadata: JSON.stringify({ originalError: String(e) }),
+      })
+    }
+    throw e
   }
 }

@@ -1,9 +1,6 @@
-'use strict'
-
 import { randomUUID } from 'node:crypto'
 import { ListObjectsV2Result } from '@storage/object'
 import { FastifyInstance } from 'fastify'
-import { Knex } from 'knex'
 import app from '../app'
 import { getConfig } from '../config'
 import { useMockObject, useMockQueue } from './common'
@@ -11,8 +8,6 @@ import { useMockObject, useMockQueue } from './common'
 const { serviceKeyAsync } = getConfig()
 let appInstance: FastifyInstance
 let serviceKey: string = ''
-
-let tnx: Knex.Transaction | undefined
 
 useMockObject()
 useMockQueue()
@@ -23,9 +18,6 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  if (tnx) {
-    await tnx.commit()
-  }
   await appInstance.close()
 })
 

@@ -1,4 +1,9 @@
-'use strict'
+vi.hoisted(() => {
+  process.env.PG_QUEUE_ENABLE = 'true'
+  process.env.MULTI_TENANT = 'true'
+  process.env.IS_MULTITENANT = 'true'
+})
+
 import { getConfig, mergeConfig } from '../config'
 
 const { multitenantDatabaseUrl } = getConfig()
@@ -8,36 +13,31 @@ mergeConfig({
 })
 
 import { encrypt, signJWT } from '@internal/auth'
+import { JWKSManagerStorePg } from '@internal/auth/jwks'
 import { TENANTS_JWKS_UPDATE_CHANNEL } from '@internal/auth/jwks/channels'
 import { UrlSigningJwkGenerator } from '@internal/auth/jwks/generator'
-import { JWKSManagerStoreKnex } from '@internal/auth/jwks/store-knex'
 import { TENANT_JWKS_CACHE_NAME } from '@internal/cache'
 import {
+  closeMultitenantPg,
   deleteTenantConfig,
   getJwtSecret,
   jwksManager,
   listenForTenantUpdate,
 } from '@internal/database'
-import { cacheRequestsTotal } from '@internal/monitoring/metrics'
+import * as metrics from '@internal/monitoring/metrics'
 import { PostgresPubSub } from '@internal/pubsub'
 import dotenv from 'dotenv'
 import * as migrate from '../internal/database/migrations/migrate'
-import { multitenantKnex } from '../internal/database/multitenant-db'
 import { adminApp, mockQueue } from './common'
-import { createMockKnexReturning } from './mocks/knex-mock'
 import { assertLogicalLookupMetrics } from './utils/cache-metrics'
 import { mockCreateLruCache } from './utils/cache-mock'
 import { waitForEventually } from './utils/promise'
 
 dotenv.config({ path: '.env.test' })
 
-const TENANT_JWKS_TEST_TIMEOUT_MS = 10000
-// Keep helper-level waits shorter than the per-test timeout
-// so helper errors surface first.
+// Keep helper-level waits short so helper errors surface first.
 const TENANT_JWKS_HELPER_TIMEOUT_MS = 4000
 const tenantId = 'abc123'
-
-jest.setTimeout(TENANT_JWKS_TEST_TIMEOUT_MS)
 
 const testJwks = {
   oct: {
@@ -73,7 +73,7 @@ type JwksModule = typeof import('../internal/auth/jwks')
 async function loadJwksModules(
   maxItems: number
 ): Promise<{ databaseModule: DatabaseModule; jwksModule: JwksModule }> {
-  jest.resetModules()
+  vi.resetModules()
 
   const configModule = await import('../config')
   configModule.getConfig({ reload: true })
@@ -123,7 +123,7 @@ beforeAll(async () => {
   await migrate.runMultitenantMigrations()
   await pubSub.start()
   await listenForTenantUpdate(pubSub)
-  jest.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
+  vi.spyOn(migrate, 'runMigrationsOnTenant').mockResolvedValue()
 })
 
 beforeEach(async () => {
@@ -155,8 +155,9 @@ afterEach(async () => {
 })
 
 afterAll(async () => {
+  await adminApp.close()
   await pubSub.close()
-  await multitenantKnex.destroy()
+  await closeMultitenantPg()
 })
 
 describe('Tenant jwks configs', () => {
@@ -379,7 +380,7 @@ describe('Tenant jwks configs', () => {
   })
 
   test('Config always retrieves concurrent requests from cache', async () => {
-    const listActiveSpy = jest.spyOn(jwksManager['storage'], 'listActive')
+    const listActiveSpy = vi.spyOn(jwksManager['storage'], 'listActive')
     try {
       const results = await Promise.all([
         jwksManager.getJwksTenantConfig(tenantId),
@@ -402,7 +403,7 @@ describe('Tenant jwks configs', () => {
     }
 
     const { databaseModule, jwksModule } = await loadJwksModules(2)
-    const listActiveSpy = jest.spyOn(databaseModule.jwksManager['storage'], 'listActive')
+    const listActiveSpy = vi.spyOn(databaseModule.jwksManager['storage'], 'listActive')
 
     try {
       listActiveSpy.mockImplementation(async () => {
@@ -422,15 +423,15 @@ describe('Tenant jwks configs', () => {
       tenantIds.forEach((tenantId) => {
         jwksModule.deleteTenantJwksConfig(tenantId)
       })
-      jest.dontMock('@internal/cache')
-      jest.resetModules()
+      vi.doUnmock('@internal/cache')
+      vi.resetModules()
       listActiveSpy.mockRestore()
     }
   })
 
   test('Config records one cache request per logical lookup', async () => {
-    const listActiveSpy = jest.spyOn(jwksManager['storage'], 'listActive')
-    const addSpy = jest.spyOn(cacheRequestsTotal, 'add')
+    const listActiveSpy = vi.spyOn(jwksManager['storage'], 'listActive')
+    const recordSpy = vi.spyOn(metrics, 'recordCacheRequest')
     const lookupTenantId = 'jwks-cache-metrics-lookup'
     const encryptedJwk = {
       id: 'cache-metrics',
@@ -444,7 +445,7 @@ describe('Tenant jwks configs', () => {
       listActiveSpy.mockImplementation(() => listActiveRequest.promise)
 
       await assertLogicalLookupMetrics({
-        addSpy,
+        recordSpy,
         backendCallSpy: listActiveSpy,
         cacheName: TENANT_JWKS_CACHE_NAME,
         startLookups: () => [
@@ -461,7 +462,7 @@ describe('Tenant jwks configs', () => {
       })
     } finally {
       listActiveSpy.mockRestore()
-      addSpy.mockRestore()
+      recordSpy.mockRestore()
     }
   })
 
@@ -520,7 +521,7 @@ describe('Tenant jwks configs', () => {
   })
 
   test('Generate all jwks when already running', async () => {
-    const statusSpy = jest
+    const statusSpy = vi
       .spyOn(UrlSigningJwkGenerator, 'getGenerationStatus')
       .mockReturnValueOnce({ running: true, sent: 99 })
 
@@ -541,7 +542,7 @@ describe('Tenant jwks configs', () => {
   })
 
   test('Ensure list tenants exits before yield if no items are returned', async () => {
-    const listTenantsSpy = jest
+    const listTenantsSpy = vi
       .spyOn(jwksManager['storage'], 'listTenantsWithoutKindPaginated')
       .mockResolvedValue([])
     try {
@@ -608,14 +609,122 @@ describe('Tenant jwks configs', () => {
   })
 
   test('Storage.insert correctly throws if insert fails when not idempotent', async () => {
-    const storage = new JWKSManagerStoreKnex(createMockKnexReturning([]))
+    const storage = new JWKSManagerStorePg({
+      query: vi.fn().mockResolvedValue({ rows: [] }),
+    } as never)
     const insert = storage.insert('tenant-id', 'encrypted', 'kind')
     await expect(insert).rejects.toThrow('failed to insert jwk')
   })
 
   test('Storage.insert correctly throws if fails to find conflicting row during idempotent insert', async () => {
-    const storage = new JWKSManagerStoreKnex(createMockKnexReturning({}))
+    const storage = new JWKSManagerStorePg({
+      query: vi
+        .fn()
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [{}] }),
+    } as never)
     const insert = storage.insert('tenant-id', 'encrypted', 'kind', true)
     await expect(insert).rejects.toThrow('failed to find existing jwk on idempotent insert')
+  })
+
+  test('Roll url signing key', async () => {
+    const queueSendSpy = mockQueue().sendSpy
+    const queueSpyAwaiter = new Promise((resolve) => {
+      queueSendSpy.mockImplementationOnce((...args) => {
+        resolve(args)
+      })
+    })
+    try {
+      const response = await adminApp.inject({
+        method: 'POST',
+        url: `/tenants/${tenantId}/jwks/url-signing/roll`,
+        headers: {
+          apikey: process.env.ADMIN_API_KEYS,
+          'sb-request-id': 'sb-req-123',
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const data = response.json<{ started: boolean }>()
+      expect(data.started).toBe(true)
+
+      await queueSpyAwaiter
+      expect(queueSendSpy).toHaveBeenCalledTimes(1)
+      const [[callArg]] = queueSendSpy.mock.calls
+      expect(callArg).toMatchObject({
+        data: { tenantId, sbReqId: 'sb-req-123' },
+        name: 'tenants-jwks-roll-url-signing-key-v1',
+      })
+    } finally {
+      queueSendSpy.mockRestore()
+    }
+  })
+
+  test('Roll url signing key when no key exists', async () => {
+    let configAwaiter = createJwkConfigChangeAwaiter()
+
+    const config = await jwksManager.getJwksTenantConfig(tenantId)
+    expect(config.keys.length).toBe(1)
+    const { kid } = config.keys[0]
+
+    await adminApp.inject({
+      method: 'PUT',
+      url: `/tenants/${tenantId}/jwks/${kid}`,
+      payload: { active: false },
+      headers: {
+        apikey: process.env.ADMIN_API_KEYS,
+      },
+    })
+
+    await expect(configAwaiter).resolves.toBe(tenantId)
+
+    const configBeforeRoll = await waitForEventually(
+      () => jwksManager.getJwksTenantConfig(tenantId),
+      (value) => value.keys.length === 0,
+      `tenant ${tenantId} JWKS to clear after deactivation`
+    )
+    expect(configBeforeRoll.keys.length).toBe(0)
+
+    configAwaiter = createJwkConfigChangeAwaiter()
+    const { oldKid, newKid } = await jwksManager.rollUrlSigningJwk(tenantId)
+
+    expect(oldKid).toBeNull()
+    expect(newKid).toContain('storage-url-signing-key')
+
+    await expect(configAwaiter).resolves.toBe(tenantId)
+    const configAfterRoll = await waitForEventually(
+      () => jwksManager.getJwksTenantConfig(tenantId),
+      (value) => value.keys.length === 1,
+      `tenant ${tenantId} JWKS to clear after deactivation`
+    )
+    expect(configAfterRoll.keys.length).toBe(1)
+    expect(configAfterRoll.keys[0].kid).toBe(newKid)
+  })
+
+  test('Roll url signing key atomically replaces existing key', async () => {
+    const configBefore = await jwksManager.getJwksTenantConfig(tenantId)
+    expect(configBefore.keys.length).toBe(1)
+    const oldKid = configBefore.keys[0].kid
+
+    const configAwaiter = createJwkConfigChangeAwaiter()
+    const { oldKid: returnedOldKid, newKid } = await jwksManager.rollUrlSigningJwk(tenantId)
+
+    expect(returnedOldKid).toBe(oldKid)
+    expect(newKid).not.toBe(oldKid)
+    expect(newKid).toContain('storage-url-signing-key')
+
+    await expect(configAwaiter).resolves.toBe(tenantId)
+    const configAfter = await waitForEventually(
+      () => jwksManager.getJwksTenantConfig(tenantId),
+      (value) => value.keys[0].kid !== oldKid,
+      `tenant ${tenantId} JWKS to clear after deactivation`
+    )
+
+    await jwksManager.getJwksTenantConfig(tenantId)
+    expect(configAfter.keys.length).toBe(1)
+    expect(configAfter.keys[0].kid).toBe(newKid)
+
+    const activeKeys = await jwksManager['storage'].listActive(tenantId, 'storage-url-signing-key')
+    expect(activeKeys.length).toBe(1)
+    expect(activeKeys[0].id).toBe(newKid.split('_')[1])
   })
 })

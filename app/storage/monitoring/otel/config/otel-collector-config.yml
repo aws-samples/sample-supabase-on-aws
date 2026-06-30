@@ -15,14 +15,26 @@ processors:
   batch/metrics:
     send_batch_size: 10000
     timeout: 10s
-  # Copy region and instance from Resource attributes to metric data point attributes
-  # This ensures all metrics have the region and instance labels
+  # Copy Resource attributes to metric data point attributes.
+  # This ensures all metrics have stable routing labels and a unique writer label.
   transform/add_resource_attributes:
     metric_statements:
       - context: datapoint
         statements:
           - set(attributes["region"], resource.attributes["region"]) where resource.attributes["region"] != nil
           - set(attributes["instance"], resource.attributes["instance"]) where resource.attributes["instance"] != nil
+          - set(attributes["service.name"], resource.attributes["service.name"]) where resource.attributes["service.name"] != nil
+          - set(attributes["service_instance_id"], resource.attributes["service.instance.id"]) where resource.attributes["service.instance.id"] != nil
+          - set(attributes["worker_id"], resource.attributes["worker.id"]) where resource.attributes["worker.id"] != nil
+          - set(attributes["platformatic_application_id"], resource.attributes["platformatic.application.id"]) where resource.attributes["platformatic.application.id"] != nil
+  # Prometheus exporter maps resource service.instance.id to the reserved
+  # instance label. Keep the explicit service_instance_id datapoint label above,
+  # but remove the resource attribute so it does not collide with host instance.
+  transform/drop_prometheus_reserved_resource_attrs:
+    metric_statements:
+      - context: resource
+        statements:
+          - delete_key(attributes, "service.instance.id")
   # Add storage_api_otel_ prefix to all metrics
   # Note: storage_api_ transform must be FIRST to avoid double prefix
   metricstransform/host:
@@ -169,7 +181,13 @@ service:
     metrics/otel:
       receivers: [otlp]
       processors:
-        [memory_limiter, transform/add_resource_attributes, metricstransform/host, batch/metrics]
+        [
+          memory_limiter,
+          transform/add_resource_attributes,
+          transform/drop_prometheus_reserved_resource_attrs,
+          metricstransform/host,
+          batch/metrics,
+        ]
       exporters: [prometheusremotewrite]
     metrics/prometheus:
       receivers: [otlp]
@@ -177,6 +195,7 @@ service:
         [
           memory_limiter,
           transform/add_resource_attributes,
+          transform/drop_prometheus_reserved_resource_attrs,
           metricstransform/prom_prefix,
           batch/metrics,
         ]

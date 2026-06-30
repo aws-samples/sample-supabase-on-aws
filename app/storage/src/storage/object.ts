@@ -1,11 +1,20 @@
 import { randomUUID } from 'node:crypto'
-import { SignedUploadToken, signJWT, verifyJWT } from '@internal/auth'
+import {
+  isDownloadScopedToken,
+  isUploadScopedToken,
+  SIGNED_URL_SCOPE_DOWNLOAD,
+  SIGNED_URL_SCOPE_UPLOAD,
+  SignedToken,
+  SignedUploadToken,
+  SignedUrlScope,
+  signJWT,
+  verifyJWT,
+} from '@internal/auth'
 import { getJwtSecret } from '@internal/database'
 import { ERRORS } from '@internal/errors'
 import { StorageObjectLocator } from '@storage/locator'
 import { Obj } from '@storage/schemas'
 import { FastifyRequest } from 'fastify/types/request'
-import { getConfig } from '../config'
 import { ObjectMetadata, StorageBackendAdapter } from './backend'
 import { Database, FindObjectFilters, SearchObjectOption } from './database'
 import {
@@ -16,10 +25,12 @@ import {
   ObjectRemovedMove,
   ObjectUpdatedMetadata,
 } from './events'
-import { mustBeValidKey } from './limits'
+import {
+  MAX_OBJECTS_PER_DELETE_BATCH,
+  MAX_OBJECTS_PER_LOOKUP_BATCH,
+  mustBeValidKey,
+} from './limits'
 import { CanUploadMetadata, fileUploadFromRequest, Uploader, UploadRequest } from './uploader'
-
-const { requestUrlLengthLimit } = getConfig()
 
 interface CopyObjectParams {
   sourceKey: string
@@ -28,6 +39,7 @@ interface CopyObjectParams {
   owner?: string
   copyMetadata?: boolean
   upsert?: boolean
+  uploadType: 'standard' | 's3' | 'resumable'
   metadata?: {
     cacheControl?: string
     mimetype?: string
@@ -126,14 +138,16 @@ export class ObjectStorage {
    */
   async deleteObject(objectName: string) {
     const obj = await this.db.withTransaction(async (db) => {
-      const obj = await db.asSuperUser().findObject(this.bucketId, objectName, 'id,version', {
-        forUpdate: true,
-      })
+      const obj = await db
+        .asSuperUser()
+        .findObject(this.bucketId, objectName, 'id,version,metadata', {
+          forUpdate: true,
+        })
 
       const deleted = await db.deleteObject(this.bucketId, objectName)
 
       if (!deleted) {
-        throw ERRORS.NoSuchKey(objectName)
+        throw ERRORS.AccessDenied('Access denied')
       }
 
       await this.backend.deleteObject(
@@ -155,6 +169,7 @@ export class ObjectStorage {
       version: obj.version,
       bucketId: this.bucketId,
       reqId: this.db.reqId,
+      sbReqId: this.db.sbReqId,
       metadata: obj.metadata,
     })
   }
@@ -165,45 +180,31 @@ export class ObjectStorage {
    * @param prefixes
    */
   async deleteObjects(prefixes: string[]) {
-    let results: { name: string }[] = []
+    const results: { name: string }[] = []
 
-    for (let i = 0; i < prefixes.length; ) {
-      const prefixesSubset: string[] = []
-      let urlParamLength = 0
-
-      for (; i < prefixes.length && urlParamLength < requestUrlLengthLimit; i++) {
-        const prefix = prefixes[i]
-        prefixesSubset.push(prefix)
-        urlParamLength += encodeURIComponent(prefix).length + 9 // length of '%22%2C%22'
-      }
+    for (let i = 0; i < prefixes.length; i += MAX_OBJECTS_PER_DELETE_BATCH) {
+      const prefixesSubset = prefixes.slice(i, i + MAX_OBJECTS_PER_DELETE_BATCH)
 
       await this.db.withTransaction(async (db) => {
         const data = await db.deleteObjects(this.bucketId, prefixesSubset, 'name')
 
         if (data.length > 0) {
-          results = results.concat(data)
+          results.push(...data)
 
           // if successfully deleted, delete from s3 too
           // todo: consider moving this to a queue
           const prefixesToDelete = data.reduce((all, { name, version }) => {
-            all.push(
-              this.location.getKeyLocation({
-                tenantId: db.tenantId,
-                bucketId: this.bucketId,
-                objectName: name,
-                version,
-              })
-            )
+            const location = this.location.getKeyLocation({
+              tenantId: db.tenantId,
+              bucketId: this.bucketId,
+              objectName: name,
+              version,
+            })
+
+            all.push(location)
 
             if (version) {
-              all.push(
-                this.location.getKeyLocation({
-                  tenantId: db.tenantId,
-                  bucketId: this.bucketId,
-                  objectName: name,
-                  version,
-                }) + '.info'
-              )
+              all.push(`${location}.info`)
             }
             return all
           }, [] as string[])
@@ -217,6 +218,7 @@ export class ObjectStorage {
                 name: object.name,
                 bucketId: this.bucketId,
                 reqId: this.db.reqId,
+                sbReqId: this.db.sbReqId,
                 version: object.version,
                 metadata: object.metadata,
               })
@@ -246,6 +248,7 @@ export class ObjectStorage {
       bucketId: this.bucketId,
       metadata,
       reqId: this.db.reqId,
+      sbReqId: this.db.sbReqId,
     })
 
     return result
@@ -301,6 +304,7 @@ export class ObjectStorage {
     conditions,
     copyMetadata,
     upsert,
+    uploadType,
     metadata: fileMetadata,
     userMetadata,
   }: CopyObjectParams) {
@@ -393,10 +397,11 @@ export class ObjectStorage {
         if (existingDestObject) {
           await ObjectAdminDelete.send({
             name: existingDestObject.name,
-            bucketId: existingDestObject.bucket_id,
+            bucketId: existingDestObject.bucket_id ?? destinationBucket,
             tenant: this.db.tenant(),
             version: existingDestObject.version,
             reqId: this.db.reqId,
+            sbReqId: this.db.sbReqId,
           })
         }
 
@@ -409,7 +414,9 @@ export class ObjectStorage {
         version: newVersion,
         bucketId: destinationBucket,
         metadata,
+        uploadType,
         reqId: this.db.reqId,
+        sbReqId: this.db.sbReqId,
       })
 
       return {
@@ -425,6 +432,7 @@ export class ObjectStorage {
         tenant: this.db.tenant(),
         version: newVersion,
         reqId: this.db.reqId,
+        sbReqId: this.db.sbReqId,
       })
       throw e
     }
@@ -441,6 +449,7 @@ export class ObjectStorage {
     sourceObjectName: string,
     destinationBucket: string,
     destinationObjectName: string,
+    uploadType: 'standard' | 's3' | 'resumable',
     owner?: string
   ) {
     mustBeValidKey(destinationObjectName)
@@ -525,6 +534,7 @@ export class ObjectStorage {
           tenant: this.db.tenant(),
           version: sourceObj.version,
           reqId: this.db.reqId,
+          sbReqId: this.db.sbReqId,
         })
 
         await Promise.allSettled([
@@ -533,6 +543,7 @@ export class ObjectStorage {
             name: sourceObjectName,
             bucketId: this.bucketId,
             reqId: this.db.reqId,
+            sbReqId: this.db.sbReqId,
             version: sourceObject.version,
             metadata: sourceObject.metadata,
           }),
@@ -542,6 +553,7 @@ export class ObjectStorage {
             version: newVersion,
             bucketId: destinationBucket,
             metadata,
+            uploadType,
             oldObject: {
               name: sourceObjectName,
               bucketId: this.bucketId,
@@ -549,6 +561,7 @@ export class ObjectStorage {
               version: sourceObject.version,
             },
             reqId: this.db.reqId,
+            sbReqId: this.db.sbReqId,
           }),
         ])
 
@@ -570,6 +583,7 @@ export class ObjectStorage {
         tenant: this.db.tenant(),
         version: newVersion,
         reqId: this.db.reqId,
+        sbReqId: this.db.sbReqId,
       })
       throw e
     }
@@ -646,28 +660,26 @@ export class ObjectStorage {
       searchResult = delimitedResults
     }
 
-    let isTruncated = false
-
-    if (searchResult.length > limit) {
-      searchResult = searchResult.slice(0, limit)
-      isTruncated = true
-    }
+    const isTruncated = searchResult.length > limit
+    const resultCount = isTruncated ? limit : searchResult.length
 
     const folders: Obj[] = []
     const objects: Obj[] = []
-    searchResult.forEach((obj) => {
+    for (let index = 0; index < resultCount; index++) {
+      const obj = searchResult[index]
       const target = obj.id === null ? folders : objects
       const name = obj.id === null && !obj.name.endsWith('/') ? obj.name + '/' : obj.name
       target.push({
         ...obj,
         name: options?.encodingType === 'url' ? encodeURIComponent(name) : name,
       })
-    })
+    }
 
     let nextContinuationToken: string | undefined
     let nextCursorKey: string | undefined
 
     if (isTruncated) {
+      const lastObject = searchResult[resultCount - 1]
       const sortColumn = (cursor?.sortColumn || options?.sortBy?.column) as
         | 'name'
         | 'created_at'
@@ -675,15 +687,15 @@ export class ObjectStorage {
         | undefined
 
       nextContinuationToken = encodeContinuationToken({
-        startAfter: searchResult[searchResult.length - 1].name,
+        startAfter: lastObject.name,
         sortOrder: cursor?.sortOrder || options?.sortBy?.order,
         sortColumn,
         sortColumnAfter:
-          sortColumn && sortColumn !== 'name' && searchResult[searchResult.length - 1][sortColumn]
-            ? new Date(searchResult[searchResult.length - 1][sortColumn] || '').toISOString()
+          sortColumn && sortColumn !== 'name' && lastObject[sortColumn]
+            ? new Date(lastObject[sortColumn] || '').toISOString()
             : undefined,
       })
-      nextCursorKey = searchResult[searchResult.length - 1].name
+      nextCursorKey = lastObject.name
     }
 
     return {
@@ -710,21 +722,35 @@ export class ObjectStorage {
   ) {
     await this.findObject(objectName)
 
-    metadata = Object.keys(metadata || {}).reduce((all, key) => {
-      if (!all[key]) {
-        delete all[key]
+    metadata = metadata || {}
+    for (const key in metadata) {
+      if (!Object.prototype.hasOwnProperty.call(metadata, key)) {
+        continue
       }
-      return all
-    }, metadata || {})
+
+      if (!metadata[key]) {
+        delete metadata[key]
+      }
+    }
 
     // security-in-depth: as signObjectUrl could be used as a signing oracle,
-    // make sure it's never able to specify a role JWT claim
+    // make sure it's never able to specify a role JWT claim, nor the claims that
+    // identify an upload token (upsert/owner) — otherwise a download token could
+    // be crafted to satisfy the upload-endpoint's legacy compatibility check.
     delete metadata['role']
+    delete metadata['upsert']
+    delete metadata['owner']
 
     const urlParts = url.split('/')
     const urlToSign = decodeURI(urlParts.splice(3).join('/'))
     const { urlSigningKey } = await getJwtSecret(this.db.tenantId)
-    const token = await signJWT({ url: urlToSign, ...metadata }, urlSigningKey, expiresIn)
+    // `url` and `scope` are spread last so attacker-controlled metadata can never
+    // override the intended object path or the token scope (token-forgery defense).
+    const token = await signJWT(
+      { ...metadata, url: urlToSign, scope: SIGNED_URL_SCOPE_DOWNLOAD },
+      urlSigningKey,
+      expiresIn
+    )
 
     let urlPath = 'object'
 
@@ -742,23 +768,25 @@ export class ObjectStorage {
    * @param expiresIn
    */
   async signObjectUrls(paths: string[], expiresIn: number) {
-    let results: { name: string }[] = []
+    let results: { name: string }[]
 
-    for (let i = 0; i < paths.length; ) {
-      const pathsSubset = []
-      let urlParamLength = 0
+    if (paths.length <= MAX_OBJECTS_PER_LOOKUP_BATCH) {
+      results = await this.findObjects(paths, 'name')
+    } else {
+      results = []
 
-      for (; i < paths.length && urlParamLength < requestUrlLengthLimit; i++) {
-        const path = paths[i]
-        pathsSubset.push(path)
-        urlParamLength += encodeURIComponent(path).length + 9 // length of '%22%2C%22'
+      for (let i = 0; i < paths.length; i += MAX_OBJECTS_PER_LOOKUP_BATCH) {
+        const pathsSubset = paths.slice(i, i + MAX_OBJECTS_PER_LOOKUP_BATCH)
+
+        const objects = await this.findObjects(pathsSubset, 'name')
+        results.push(...objects)
       }
-
-      const objects = await this.findObjects(pathsSubset, 'name')
-      results = results.concat(objects)
     }
 
-    const nameSet = new Set(results.map(({ name }) => name))
+    const nameSet = new Set<string>()
+    for (const { name } of results) {
+      nameSet.add(name)
+    }
 
     const { urlSigningKey } = await getJwtSecret(this.db.tenantId)
 
@@ -768,7 +796,11 @@ export class ObjectStorage {
         let signedURL = null
         if (nameSet.has(path)) {
           const urlToSign = `${this.bucketId}/${path}`
-          const token = await signJWT({ url: urlToSign }, urlSigningKey, expiresIn)
+          const token = await signJWT(
+            { url: urlToSign, scope: SIGNED_URL_SCOPE_DOWNLOAD },
+            urlSigningKey,
+            expiresIn
+          )
           signedURL = `/object/sign/${urlToSign}?token=${token}`
         } else {
           error = 'Either the object does not exist or you do not have access to it'
@@ -813,7 +845,7 @@ export class ObjectStorage {
 
     const { urlSigningKey } = await getJwtSecret(this.db.tenantId)
     const token = await signJWT(
-      { owner, url, upsert: Boolean(options?.upsert) },
+      { owner, url, upsert: Boolean(options?.upsert), scope: SIGNED_URL_SCOPE_UPLOAD },
       urlSigningKey,
       expiresIn
     )
@@ -822,32 +854,47 @@ export class ObjectStorage {
   }
 
   /**
-   * Verify the signature for a specific object
+   * Verify a signed-URL token for a specific object, enforcing that it was issued
+   * for the requested action. This is the single place that validates a signed
+   * token: signature, scope, object-path binding, and expiry.
    * @param token
    * @param objectName
+   * @param scope the action the token must be authorized for (download or upload)
    */
-  async verifyObjectSignature(token: string, objectName: string) {
+  async verifyObjectSignature<Scope extends SignedUrlScope>(
+    token: string,
+    objectName: string,
+    scope: Scope
+  ): Promise<Scope extends typeof SIGNED_URL_SCOPE_UPLOAD ? SignedUploadToken : SignedToken> {
     const { secret: jwtSecret, jwks } = await getJwtSecret(this.db.tenantId)
 
-    let payload: SignedUploadToken
+    let payload: SignedToken | SignedUploadToken
     try {
-      payload = (await verifyJWT(token, jwtSecret, jwks)) as SignedUploadToken
+      payload = await verifyJWT<SignedToken | SignedUploadToken>(token, jwtSecret, jwks)
     } catch (e) {
       const err = e as Error
       throw ERRORS.InvalidJWT(err)
     }
 
-    const { url, exp } = payload
+    const hasValidScope =
+      scope === SIGNED_URL_SCOPE_UPLOAD
+        ? isUploadScopedToken(payload)
+        : isDownloadScopedToken(payload)
+    if (!hasValidScope) {
+      throw ERRORS.InvalidSignature(`Token is not scoped for ${scope}`)
+    }
 
-    if (url !== `${this.bucketId}/${objectName}`) {
+    if (payload.url !== `${this.bucketId}/${objectName}`) {
       throw ERRORS.InvalidSignature()
     }
 
-    if (exp * 1000 < Date.now()) {
+    if (payload.exp * 1000 < Date.now()) {
       throw ERRORS.ExpiredSignature()
     }
 
-    return payload
+    // the scope check above guarantees the payload matches the requested scope;
+    // TS can't correlate the runtime value with the conditional return type.
+    return payload as Scope extends typeof SIGNED_URL_SCOPE_UPLOAD ? SignedUploadToken : SignedToken
   }
 }
 
@@ -884,7 +931,7 @@ function decodeContinuationToken(token: string): ContinuationToken {
   for (const part of decodedParts) {
     const partMatch = part.match(/^(\S):(.*)/)
     if (!partMatch || partMatch.length !== 3 || !(partMatch[1] in CONTINUATION_TOKEN_PART_MAP)) {
-      throw new Error('Invalid continuation token')
+      throw ERRORS.InvalidParameter('continuation token')
     }
     result[CONTINUATION_TOKEN_PART_MAP[partMatch[1]]] = partMatch[2]
   }

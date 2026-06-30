@@ -1,18 +1,25 @@
-import {
-  httpRequestDuration,
-  httpRequestSizeBytes,
-  httpResponseSizeBytes,
-} from '@internal/monitoring/metrics'
+import { recordHttpRequestMetrics } from '@internal/monitoring/metrics'
 import { handleMetricsRequest } from '@internal/monitoring/otel-metrics'
 import fastifyPlugin from 'fastify-plugin'
 import { getConfig } from '../../config'
 
 const { prometheusMetricsEnabled } = getConfig()
 
+function parseMetricSizeHeader(value: number | string | string[] | undefined): number | undefined {
+  let size: number | undefined
+
+  if (typeof value === 'number') {
+    size = value
+  } else if (typeof value === 'string') {
+    size = parseInt(value, 10)
+  }
+
+  return typeof size === 'number' && Number.isFinite(size) && size > 0 ? size : undefined
+}
+
 interface MetricsOptions {
   enabledEndpoint?: boolean
   excludeRoutes?: string[]
-  groupStatusCodes?: boolean
 }
 
 export const metrics = (options: MetricsOptions = {}) =>
@@ -41,8 +48,6 @@ export const metricsEndpoint = ({ enabledEndpoint }: MetricsOptions) => {
 interface HttpMetricsOptions {
   /** Routes to exclude from metrics collection */
   excludeRoutes?: string[]
-  /** Whether to group status codes (2xx, 3xx, etc.) */
-  groupStatusCodes?: boolean
 }
 
 /**
@@ -59,67 +64,54 @@ export const httpMetrics = (options: HttpMetricsOptions = {}) =>
         '/health',
         '/healthcheck',
       ]
-      const groupStatusCodes = options.groupStatusCodes ?? true
 
       // Hook into request lifecycle to measure duration
-      fastify.addHook('onRequest', async (request) => {
+      fastify.addHook('onRequest', (request, _reply, done) => {
         // Store start time on request for later use
         request.metricsStartTime = process.hrtime.bigint()
+        done()
       })
 
-      fastify.addHook('onResponse', async (request, reply) => {
+      fastify.addHook('onResponse', (request, reply, done) => {
         const route = request.routeOptions?.url || 'unknown'
 
         // Skip excluded routes (match start of path)
         if (excludeRoutes.some((r) => route === r || route.startsWith(r + '/'))) {
+          done()
           return
         }
 
         const startTime = request.metricsStartTime
-        if (!startTime) return
+        if (!startTime) {
+          done()
+          return
+        }
 
         // Calculate duration in seconds
         const endTime = process.hrtime.bigint()
         const durationNs = endTime - startTime
         const durationSeconds = Number(durationNs) / 1e9
 
-        const method = request.method
-        const statusCode = groupStatusCodes
-          ? `${Math.floor(reply.statusCode / 100)}xx`
-          : String(reply.statusCode)
-
-        const attributes = {
-          method,
-          operation: request.operation?.type || 'unknown',
-          status_code: statusCode,
-          tenantId: request.tenantId || '',
-        }
-
-        // Record duration (histogram count replaces httpRequestsTotal)
-        httpRequestDuration.record(durationSeconds, attributes)
+        const operation =
+          request.operation?.type || request.routeOptions?.config?.operation?.type || 'unknown'
 
         // Record request size from content-length header
         const requestContentLength = request.headers['content-length']
-        if (requestContentLength) {
-          const requestSize = parseInt(requestContentLength, 10)
-          if (!isNaN(requestSize) && requestSize > 0) {
-            httpRequestSizeBytes.add(requestSize, attributes)
-          }
-        }
+        const requestSize = parseMetricSizeHeader(requestContentLength)
 
         // Record response size from content-length header
         const responseContentLength = reply.getHeader('content-length')
-        if (responseContentLength) {
-          const responseSize =
-            typeof responseContentLength === 'string'
-              ? parseInt(responseContentLength, 10)
-              : typeof responseContentLength === 'number'
-                ? responseContentLength
-                : 0
-          if (!isNaN(responseSize) && responseSize > 0) {
-            httpResponseSizeBytes.add(responseSize, attributes)
-          }
-        }
+        const responseSize = parseMetricSizeHeader(responseContentLength)
+
+        recordHttpRequestMetrics(
+          durationSeconds,
+          requestSize,
+          responseSize,
+          request.method,
+          operation,
+          reply.statusCode
+        )
+        done()
       })
     },
     { name: 'http-metrics' }

@@ -1,7 +1,12 @@
-import { Attributes, metrics } from '@opentelemetry/api'
-import { getConfig } from '../../config'
-
-const { prometheusMetricsIncludeTenantId } = getConfig()
+import type { CacheLookupOutcome } from '@internal/cache/adapter'
+import type { CacheName } from '@internal/cache/names'
+import { type Attributes, metrics } from '@opentelemetry/api'
+import {
+  createBatchObservableCounterGroup,
+  type ObservableCounterSeries,
+  safeAddCounter,
+} from './counter'
+import { HTTP_SIZE_METRICS_MAX_STATES } from './metric-limits'
 
 // ============================================================================
 // Metric Registry — tracks all metrics for admin API
@@ -48,40 +53,116 @@ export function isMetricEnabled(name: string): boolean {
 // ============================================================================
 export const meter = metrics.getMeter('storage-api')
 
-function stripTenantAttrs(attrs: Attributes): Attributes {
-  const { tenantId, tenant_id, ...rest } = attrs as Record<string, unknown>
-  return rest as Attributes
-}
-
 /**
- * Registers a metric in the admin registry and wraps .record()/.add()
- * to automatically strip tenant attributes when prometheusMetricsIncludeTenantId is false.
+ * Registers a metric in the admin registry.
  */
 export function registerMetric<T>(name: string, type: MetricType, factory: () => T): T {
   metricsRegistry.set(name, { name, type, enabled: !disabledMetrics.has(name) })
-  const instrument = factory()
-
-  if (prometheusMetricsIncludeTenantId) return instrument
-
-  // biome-ignore lint/suspicious/noExplicitAny: wrapping OTel instrument methods
-  const inst = instrument as any
-  if (typeof inst.record === 'function') {
-    const original = inst.record.bind(inst)
-    inst.record = (value: number, attrs?: Attributes) =>
-      original(value, attrs ? stripTenantAttrs(attrs) : attrs)
-  }
-  if (typeof inst.add === 'function') {
-    const original = inst.add.bind(inst)
-    inst.add = (value: number, attrs?: Attributes) =>
-      original(value, attrs ? stripTenantAttrs(attrs) : attrs)
-  }
-
-  return instrument
+  return factory()
 }
 
 // ============================================================================
 // HTTP Request Metrics
+//
+// HTTP byte counters intentionally do not check `isMetricEnabled()`. They use
+// cumulative observable counters, so skipping observations on runtime disable
+// would leave stale exported points and later jumps on re-enable.
 // ============================================================================
+type HttpSizeMetricsState = {
+  requestBytes: number
+  responseBytes: number
+  attributes: Attributes
+}
+
+const HTTP_METRICS_OVERFLOW_LABEL = 'overflow'
+
+const httpStatusCodeLabels = new Map<number, string>()
+const httpSizeMetricStates = new Set<HttpSizeMetricsState>()
+// Nested maps avoid allocating a composite key on the HTTP request hot path.
+const httpSizeMetricsByMethod = new Map<string, Map<string, Map<number, HttpSizeMetricsState>>>()
+let httpSizeMetricStateCount = 0
+
+const httpSizeOverflowState = createHttpSizeMetricsState(
+  HTTP_METRICS_OVERFLOW_LABEL,
+  HTTP_METRICS_OVERFLOW_LABEL,
+  HTTP_METRICS_OVERFLOW_LABEL
+)
+httpSizeMetricStates.add(httpSizeOverflowState)
+
+function isRecordableMetricValue(value: number | undefined): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+}
+
+function createHttpSizeMetricsState(
+  method: string,
+  operation: string,
+  statusCodeLabel: string
+): HttpSizeMetricsState {
+  return {
+    requestBytes: 0,
+    responseBytes: 0,
+    attributes: {
+      method,
+      operation,
+      status_code: statusCodeLabel,
+    },
+  }
+}
+
+function getStatusCodeLabel(statusCode: number): string {
+  let label = httpStatusCodeLabels.get(statusCode)
+
+  if (!label) {
+    label = String(statusCode)
+    httpStatusCodeLabels.set(statusCode, label)
+  }
+
+  return label
+}
+
+function getHttpSizeMetricsState(
+  method: string,
+  operation: string,
+  statusCode: number
+): HttpSizeMetricsState {
+  let byOperation = httpSizeMetricsByMethod.get(method)
+
+  if (!byOperation) {
+    if (httpSizeMetricStateCount >= HTTP_SIZE_METRICS_MAX_STATES) {
+      return httpSizeOverflowState
+    }
+
+    byOperation = new Map()
+    httpSizeMetricsByMethod.set(method, byOperation)
+  }
+
+  let byStatusCode = byOperation.get(operation)
+
+  if (!byStatusCode) {
+    if (httpSizeMetricStateCount >= HTTP_SIZE_METRICS_MAX_STATES) {
+      return httpSizeOverflowState
+    }
+
+    byStatusCode = new Map()
+    byOperation.set(operation, byStatusCode)
+  }
+
+  let state = byStatusCode.get(statusCode)
+
+  if (!state) {
+    if (httpSizeMetricStateCount >= HTTP_SIZE_METRICS_MAX_STATES) {
+      return httpSizeOverflowState
+    }
+
+    state = createHttpSizeMetricsState(method, operation, getStatusCodeLabel(statusCode))
+    byStatusCode.set(statusCode, state)
+    httpSizeMetricStates.add(state)
+    httpSizeMetricStateCount++
+  }
+
+  return state
+}
+
 export const httpRequestDuration = registerMetric(
   'http_request_duration_seconds',
   'histogram',
@@ -92,49 +173,152 @@ export const httpRequestDuration = registerMetric(
     })
 )
 
-export const httpRequestSizeBytes = registerMetric('http_request_size_bytes', 'counter', () =>
-  meter.createCounter('http_request_size_bytes', {
+const httpRequestSizeBytes = registerMetric('http_request_size_bytes', 'counter', () =>
+  meter.createObservableCounter('http_request_size_bytes', {
     description: 'Total bytes received in HTTP requests (from content-length header)',
     unit: 'bytes',
   })
 )
 
-export const httpResponseSizeBytes = registerMetric('http_response_size_bytes', 'counter', () =>
-  meter.createCounter('http_response_size_bytes', {
+const httpResponseSizeBytes = registerMetric('http_response_size_bytes', 'counter', () =>
+  meter.createObservableCounter('http_response_size_bytes', {
     description: 'Total bytes sent in HTTP responses (from content-length header)',
     unit: 'bytes',
   })
 )
 
-// ============================================================================
-// Upload Metrics
-// ============================================================================
-export const fileUploadStarted = registerMetric('upload_started', 'counter', () =>
-  meter.createCounter('upload_started', {
-    description: 'Total uploads started',
-  })
+meter.addBatchObservableCallback(
+  (observer) => {
+    for (const state of httpSizeMetricStates) {
+      if (state.requestBytes > 0) {
+        observer.observe(httpRequestSizeBytes, state.requestBytes, state.attributes)
+      }
+      if (state.responseBytes > 0) {
+        observer.observe(httpResponseSizeBytes, state.responseBytes, state.attributes)
+      }
+    }
+  },
+  [httpRequestSizeBytes, httpResponseSizeBytes]
 )
 
-export const fileUploadedSuccess = registerMetric('upload_success', 'counter', () =>
-  meter.createCounter('upload_success', {
-    description: 'Total successful uploads',
-  })
-)
+function recordHttpByteSizesForState(
+  state: HttpSizeMetricsState,
+  requestSizeBytes: number | undefined,
+  responseSizeBytes: number | undefined
+): void {
+  if (isRecordableMetricValue(requestSizeBytes)) {
+    state.requestBytes = safeAddCounter(state.requestBytes, requestSizeBytes)
+  }
+
+  if (isRecordableMetricValue(responseSizeBytes)) {
+    state.responseBytes = safeAddCounter(state.responseBytes, responseSizeBytes)
+  }
+}
+
+export function recordHttpRequestMetrics(
+  durationSeconds: number,
+  requestSizeBytes: number | undefined,
+  responseSizeBytes: number | undefined,
+  method: string,
+  operation: string,
+  statusCode: number
+): void {
+  const state = getHttpSizeMetricsState(method, operation, statusCode)
+
+  httpRequestDuration.record(durationSeconds, state.attributes)
+  recordHttpByteSizesForState(state, requestSizeBytes, responseSizeBytes)
+}
+
+// ============================================================================
+// Upload Metrics
+//
+// Upload counters follow the same cumulative observable-counter semantics as
+// HTTP/cache: runtime disables must not suppress observations.
+// ============================================================================
+type UploadMetricsState = {
+  started: ObservableCounterSeries
+  success: ObservableCounterSeries
+}
+
+const uploadMetrics = createBatchObservableCounterGroup({
+  meter,
+  registerMetric,
+  maxStates: 32,
+  counters: {
+    started: {
+      name: 'upload_started',
+      description: 'Total uploads started',
+    },
+    success: {
+      name: 'upload_success',
+      description: 'Total successful uploads',
+    },
+  },
+  getKey: (uploadType: string) => uploadType,
+  createState: (uploadType: string): UploadMetricsState => ({
+    started: { count: 0, attributes: { uploadType } },
+    success: { count: 0, attributes: { uploadType } },
+  }),
+})
+
+/** Records an upload start by bumping an in-process tally. */
+export function recordUploadStarted(uploadType: string): void {
+  uploadMetrics.addStarted(uploadType)
+}
+
+/** Records an upload success by bumping an in-process tally. */
+export function recordUploadSuccess(uploadType: string): void {
+  uploadMetrics.addSuccess(uploadType)
+}
 
 // ============================================================================
 // Cache Metrics
+//
+// These observable counters intentionally do not check `isMetricEnabled()`.
+// With cumulative async OTel instruments, skipping `observe()` after a runtime
+// disable can keep the previous point exported, then jump on re-enable because
+// the in-process tally kept advancing. Drop these metrics at exporter/view
+// configuration if they need to be suppressed entirely.
 // ============================================================================
-export const cacheRequestsTotal = registerMetric('cache_requests_total', 'counter', () =>
-  meter.createCounter('cache_requests_total', {
-    description: 'Total cache lookups by cache and outcome',
-  })
-)
+type CacheMetricsState = {
+  requests: Record<CacheLookupOutcome, ObservableCounterSeries>
+  evictions: ObservableCounterSeries
+}
 
-export const cacheEvictionsTotal = registerMetric('cache_evictions_total', 'counter', () =>
-  meter.createCounter('cache_evictions_total', {
-    description: 'Total cache evictions',
-  })
-)
+const cacheMetrics = createBatchObservableCounterGroup({
+  meter,
+  registerMetric,
+  maxStates: 64,
+  counters: {
+    requests: {
+      name: 'cache_requests_total',
+      description: 'Total cache lookups by cache and outcome',
+    },
+    evictions: {
+      name: 'cache_evictions_total',
+      description: 'Total cache evictions',
+    },
+  },
+  getKey: (cache: CacheName) => cache,
+  createState: (cache: CacheName): CacheMetricsState => ({
+    requests: {
+      hit: { count: 0, attributes: { cache, outcome: 'hit' } },
+      miss: { count: 0, attributes: { cache, outcome: 'miss' } },
+      stale: { count: 0, attributes: { cache, outcome: 'stale' } },
+    },
+    evictions: { count: 0, attributes: { cache } },
+  }),
+})
+
+/** Records a single cache lookup outcome by bumping an in-process tally. */
+export function recordCacheRequest(cache: CacheName, outcome: CacheLookupOutcome): void {
+  cacheMetrics.addRequests(cache, outcome)
+}
+
+/** Records a single capacity/ttl cache eviction by bumping an in-process tally. */
+export function recordCacheEviction(cache: CacheName): void {
+  cacheMetrics.addEvictions(cache)
+}
 
 export const cacheEntries = registerMetric('cache_entries', 'gauge', () =>
   meter.createObservableGauge('cache_entries', {

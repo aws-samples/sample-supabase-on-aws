@@ -1,26 +1,42 @@
-'use strict'
+vi.hoisted(() => {
+  process.env.PG_QUEUE_ENABLE = 'true'
+})
 
-import { generateHS512JWK, SignedToken, signJWT, verifyJWT } from '@internal/auth'
-import { getPostgresConnection, getServiceKeyUser } from '@internal/database'
+import {
+  generateHS512JWK,
+  getMaxNumericJWTExpiration,
+  SIGNED_URL_SCOPE_DOWNLOAD,
+  SIGNED_URL_SCOPE_UPLOAD,
+  SignedToken,
+  signJWT,
+  verifyJWT,
+} from '@internal/auth'
+import { getPostgresConnection, getServiceKeyUser, PgTransaction } from '@internal/database'
 import { ErrorCode, StorageBackendError } from '@internal/errors'
+import { MAX_OBJECTS_PER_REQUEST } from '@storage/limits'
 import { randomUUID } from 'crypto'
 import { FastifyInstance } from 'fastify'
 import FormData from 'form-data'
 import fs from 'fs'
-import { Knex } from 'knex'
 import app from '../app'
 import { getConfig, JwksConfig, JwksConfigKeyOCT, mergeConfig } from '../config'
 import { backends, Obj } from '../storage'
 import { ObjectAdminDelete } from '../storage/events'
 import { useMockObject, useMockQueue } from './common'
-import { withDeleteEnabled } from './utils/storage'
+import { useStorage, withDeleteEnabled } from './utils/storage'
 
 const { jwtSecret, serviceKeyAsync, tenantId } = getConfig()
 const anonKey = process.env.ANON_KEY || ''
 const S3Backend = backends.S3Backend
 let appInstance: FastifyInstance
 
-let tnx: Knex.Transaction | undefined
+type SignedUrlResult = {
+  error: string | null
+  path: string
+  signedURL: string | null
+}
+
+let tnx: PgTransaction | undefined
 async function getSuperuserPostgrestClient() {
   const superUser = await getServiceKeyUser(tenantId)
 
@@ -33,6 +49,97 @@ async function getSuperuserPostgrestClient() {
   tnx = await conn.transaction()
 
   return tnx
+}
+
+async function findObject(
+  db: PgTransaction,
+  bucketId: string,
+  name: string
+): Promise<Obj | undefined> {
+  const result = await db.query<Obj>({
+    text: `
+      SELECT *
+      FROM objects
+      WHERE bucket_id = $1
+        AND name = $2
+      LIMIT 1
+    `,
+    values: [bucketId, name],
+  })
+
+  return result.rows[0]
+}
+
+async function insertObjects(
+  db: PgTransaction,
+  objects:
+    | Array<Partial<Obj> & { bucket_id: string; name: string }>
+    | (Partial<Obj> & { bucket_id: string; name: string })
+) {
+  const rows = Array.isArray(objects) ? objects : [objects]
+
+  for (const row of rows) {
+    const entries = Object.entries(row)
+    await db.query({
+      text: `
+        INSERT INTO objects (${entries.map(([column]) => column).join(', ')})
+        VALUES (${entries.map((_, index) => `$${index + 1}`).join(', ')})
+      `,
+      values: entries.map(([, value]) => value),
+    })
+  }
+}
+
+async function deleteObjectsByName(db: PgTransaction, bucketId: string, names: string | string[]) {
+  await db.query({
+    text: `
+      DELETE FROM objects
+      WHERE bucket_id = $1
+        AND name = ANY($2::text[])
+    `,
+    values: [bucketId, Array.isArray(names) ? names : [names]],
+  })
+}
+
+async function insertObjectNames(db: PgTransaction, bucketId: string, names: string[]) {
+  const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+  const versions = names.map((_, index) => `test-version-${randomUUID()}-${index}`)
+
+  await db.query({
+    text: `
+      INSERT INTO objects (bucket_id, name, owner, owner_id, version, metadata)
+      SELECT $1, seeded.name, $2::uuid, $2::text, seeded.version, $3::jsonb
+      FROM unnest($4::text[], $5::text[]) AS seeded(name, version)
+    `,
+    values: [bucketId, owner, { size: 1234 }, names, versions],
+  })
+}
+
+async function insertBucket(
+  db: PgTransaction,
+  bucket: {
+    id: string
+    name: string
+    public: boolean
+    file_size_limit: null
+    allowed_mime_types: null
+    type: string
+  }
+) {
+  await db.query({
+    text: `
+      INSERT INTO buckets (id, name, public, file_size_limit, allowed_mime_types, type)
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `,
+    values: [
+      bucket.id,
+      bucket.name,
+      bucket.public,
+      bucket.file_size_limit,
+      bucket.allowed_mime_types,
+      bucket.type,
+    ],
+  })
 }
 
 useMockObject()
@@ -84,7 +191,7 @@ describe('testing GET object', () => {
   })
 
   test('forward 304 and If-Modified-Since/If-None-Match headers', async () => {
-    const mockGetObject = jest.spyOn(S3Backend.prototype, 'getObject')
+    const mockGetObject = vi.spyOn(S3Backend.prototype, 'getObject')
     mockGetObject.mockRejectedValue({
       $metadata: {
         httpStatusCode: 304,
@@ -134,6 +241,24 @@ describe('testing GET object', () => {
     expect(response.headers['last-modified']).toBe('Wed, 12 Oct 2022 11:17:02 GMT')
     expect(response.headers['content-length']).toBe('3746')
     expect(response.headers['cache-control']).toBe('no-cache')
+  })
+
+  test('get authenticated object info returns NoSuchKey for a missing object', async () => {
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: '/object/info/authenticated/bucket2/authenticated/notfound-info.png',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toEqual({
+      statusCode: '404',
+      error: 'not_found',
+      message: 'Object not found',
+    })
+    expect(S3Backend.prototype.headObject).not.toHaveBeenCalled()
   })
 
   test('cannot get authenticated object info without the /authenticated prefix if no jwt is provided', async () => {
@@ -462,12 +587,7 @@ describe('testing POST object via multipart upload', () => {
 
     const client = await getSuperuserPostgrestClient()
 
-    const object = await client
-      .table('objects')
-      .select('*')
-      .where('name', 'sadcat-upload3012.png')
-      .where('bucket_id', 'bucket2')
-      .first()
+    const object = await findObject(client, 'bucket2', 'sadcat-upload3012.png')
 
     expect(object).not.toBeFalsy()
     expect(object?.user_metadata).toEqual({
@@ -501,12 +621,7 @@ describe('testing POST object via multipart upload', () => {
 
     const client = await getSuperuserPostgrestClient()
 
-    const object = await client
-      .table('objects')
-      .select('*')
-      .where('name', 'sadcat-upload3018.png')
-      .where('bucket_id', 'bucket2')
-      .first()
+    const object = await findObject(client, 'bucket2', 'sadcat-upload3018.png')
 
     expect(object).not.toBeFalsy()
     expect(object?.user_metadata).toEqual({
@@ -592,7 +707,7 @@ describe('testing POST object via multipart upload', () => {
     expect(response.statusCode).toBe(400)
   })
 
-  test('return 400 when uploading an object with a not allowed mime-type', async () => {
+  test('return 400 when uploading an object with a not allowed mime-type (binary path)', async () => {
     const form = new FormData()
     form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
     const headers = Object.assign({}, form.getHeaders(), {
@@ -614,6 +729,92 @@ describe('testing POST object via multipart upload', () => {
       statusCode: '415',
     })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+  })
+
+  test('return 400 when uploading a multipart form-data object with a not allowed mime-type', async () => {
+    const form = new FormData()
+    form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+    form.append('contentType', 'image/png')
+    const headers = Object.assign({}, form.getHeaders(), {
+      authorization: `Bearer ${await serviceKeyAsync}`,
+      'x-upsert': 'true',
+    })
+
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/public-limit-mime-types/sadcat-upload23.png',
+      headers,
+      payload: form,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(await response.json()).toEqual({
+      error: 'invalid_mime_type',
+      message: `mime type image/png is not supported`,
+      statusCode: '415',
+    })
+    expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+  })
+
+  test('enforces allowed mime types set through bucket update', async () => {
+    const bucketId = `allowed-mime-${randomUUID()}`
+    const authHeader = { authorization: `Bearer ${await serviceKeyAsync}` }
+
+    try {
+      const createBucketResponse = await appInstance.inject({
+        method: 'POST',
+        url: '/bucket',
+        headers: authHeader,
+        payload: {
+          name: bucketId,
+        },
+      })
+      expect(createBucketResponse.statusCode).toBe(200)
+
+      const updateBucketResponse = await appInstance.inject({
+        method: 'PUT',
+        url: `/bucket/${bucketId}`,
+        headers: authHeader,
+        payload: {
+          allowed_mime_types: ['image/jpeg'],
+        },
+      })
+      expect(updateBucketResponse.statusCode).toBe(200)
+
+      const form = new FormData()
+      form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+      form.append('contentType', 'image/png')
+
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/${bucketId}/sadcat-upload23.png`,
+        headers: {
+          ...form.getHeaders(),
+          ...authHeader,
+          'x-upsert': 'true',
+        },
+        payload: form,
+      })
+
+      expect(response.statusCode).toBe(400)
+      expect(response.json()).toEqual({
+        error: 'invalid_mime_type',
+        message: `mime type image/png is not supported`,
+        statusCode: '415',
+      })
+      expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+    } finally {
+      const db = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(db, async (db) => {
+        await db.query({
+          text: 'DELETE FROM objects WHERE bucket_id = $1',
+          values: [bucketId],
+        })
+        await db.query({
+          text: 'DELETE FROM buckets WHERE id = $1',
+          values: [bucketId],
+        })
+      })
+    }
   })
 
   test('return 400 when uploading an object with a malformed mime-type', async () => {
@@ -728,7 +929,7 @@ describe('testing POST object via multipart upload', () => {
 
   test('should not add row to database if upload fails', async () => {
     // Mock S3 upload failure.
-    jest.spyOn(S3Backend.prototype, 'uploadObject').mockRejectedValue(
+    vi.spyOn(S3Backend.prototype, 'uploadObject').mockRejectedValue(
       StorageBackendError.fromError({
         name: 'S3ServiceException',
         message: 'Unknown error',
@@ -765,14 +966,7 @@ describe('testing POST object via multipart upload', () => {
 
     // Ensure that row does not exist in database.
     const db = await getSuperuserPostgrestClient()
-    const objectResponse = await db
-      .from<Obj>('objects')
-      .select('*')
-      .where({
-        name: OBJECT_NAME,
-        bucket_id: BUCKET_ID,
-      })
-      .first()
+    const objectResponse = await findObject(db, BUCKET_ID, OBJECT_NAME)
 
     expect(objectResponse).toBe(undefined)
   })
@@ -960,7 +1154,7 @@ describe('testing POST object via binary upload', () => {
       host: 'localhost',
     })
     const setupTx = await db.transaction()
-    await setupTx.table('buckets').insert({
+    await insertBucket(setupTx, {
       id: bucketId,
       name: bucketId,
       public: true,
@@ -1022,7 +1216,7 @@ describe('testing POST object via binary upload', () => {
 
   test('should not add row to database if upload fails', async () => {
     // Mock S3 upload failure.
-    jest.spyOn(S3Backend.prototype, 'uploadObject').mockRejectedValue(
+    vi.spyOn(S3Backend.prototype, 'uploadObject').mockRejectedValue(
       StorageBackendError.fromError({
         name: 'S3ServiceException',
         message: 'Unknown error',
@@ -1062,14 +1256,7 @@ describe('testing POST object via binary upload', () => {
 
     // Ensure that row does not exist in database.
     const db = await getSuperuserPostgrestClient()
-    const objectResponse = await db
-      .from<Obj>('objects')
-      .select('*')
-      .where({
-        name: OBJECT_NAME,
-        bucket_id: BUCKET_ID,
-      })
-      .first()
+    const objectResponse = await findObject(db, BUCKET_ID, OBJECT_NAME)
     expect(objectResponse).toBe(undefined)
   })
 })
@@ -1200,6 +1387,64 @@ describe('testing PUT object via binary upload', () => {
         Key: 'bucket2/authenticated/cat.jpg',
       })
     )
+  })
+
+  test('replaces custom metadata when updating an object', async () => {
+    const path = './src/test/assets/sadcat.jpg'
+    const { size } = fs.statSync(path)
+    const objectName = `metadata-replace/${randomUUID()}.jpg`
+    const initialMetadata = { keep: false, stale: 'removed' }
+    const replacementMetadata = { keep: true, fresh: 'present' }
+
+    try {
+      const createResponse = await appInstance.inject({
+        method: 'POST',
+        url: `/object/bucket2/${objectName}`,
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+          'Content-Length': size,
+          'Content-Type': 'image/jpeg',
+          'x-metadata': Buffer.from(JSON.stringify(initialMetadata)).toString('base64'),
+        },
+        payload: fs.createReadStream(path),
+      })
+      expect(createResponse.statusCode).toBe(200)
+
+      const updateResponse = await appInstance.inject({
+        method: 'PUT',
+        url: `/object/bucket2/${objectName}`,
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+          'Content-Length': size,
+          'Content-Type': 'image/jpeg',
+          'x-metadata': Buffer.from(JSON.stringify(replacementMetadata)).toString('base64'),
+        },
+        payload: fs.createReadStream(path),
+      })
+      expect(updateResponse.statusCode).toBe(200)
+
+      const infoResponse = await appInstance.inject({
+        method: 'GET',
+        url: `/object/info/bucket2/${objectName}`,
+        headers: {
+          authorization: `Bearer ${await serviceKeyAsync}`,
+        },
+      })
+      expect(infoResponse.statusCode).toBe(200)
+      expect(infoResponse.json().metadata).toEqual(replacementMetadata)
+    } finally {
+      const db = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(db, async (db) => {
+        await db.query({
+          text: `
+            DELETE FROM objects
+            WHERE name = $1
+              AND bucket_id = $2
+          `,
+          values: [objectName, 'bucket2'],
+        })
+      })
+    }
   })
 
   test('check if RLS policies are respected: anon user is not able to update authenticated resource', async () => {
@@ -1347,15 +1592,10 @@ describe('testing copy object', () => {
     expect(jsonResponse.Key).toBe(`bucket2/authenticated/${copiedKey}`)
 
     const conn = await getSuperuserPostgrestClient()
-    const object = await conn
-      .table('objects')
-      .select('*')
-      .where('bucket_id', 'bucket2')
-      .where('name', `authenticated/${copiedKey}`)
-      .first()
+    const object = await findObject(conn, 'bucket2', `authenticated/${copiedKey}`)
 
     expect(object).not.toBeFalsy()
-    expect(object.user_metadata).toEqual({
+    expect(object!.user_metadata).toEqual({
       test1: 1234,
     })
   })
@@ -1400,18 +1640,13 @@ describe('testing copy object', () => {
     )
 
     const conn = await getSuperuserPostgrestClient()
-    const object = await conn
-      .table('objects')
-      .select('*')
-      .where('bucket_id', 'bucket2')
-      .where('name', `authenticated/${copiedKey}`)
-      .first()
+    const object = await findObject(conn, 'bucket2', `authenticated/${copiedKey}`)
 
     expect(object).not.toBeFalsy()
-    expect(object.user_metadata).toEqual({
+    expect(object!.user_metadata).toEqual({
       newMetadata: 'test1',
     })
-    expect(object.metadata).toEqual(
+    expect(object!.metadata).toEqual(
       expect.objectContaining({
         cacheControl: 'max-age=999',
         mimetype: 'image/gif',
@@ -1440,15 +1675,10 @@ describe('testing copy object', () => {
     expect(jsonResponse.Key).toBe(`bucket2/authenticated/${copiedKey}`)
 
     const conn = await getSuperuserPostgrestClient()
-    const object = await conn
-      .table('objects')
-      .select('*')
-      .where('bucket_id', 'bucket2')
-      .where('name', `authenticated/${copiedKey}`)
-      .first()
+    const object = await findObject(conn, 'bucket2', `authenticated/${copiedKey}`)
 
     expect(object).not.toBeFalsy()
-    expect(object.user_metadata).toBeNull()
+    expect(object!.user_metadata).toBeNull()
   })
 
   test('cannot copy objects across buckets when RLS dont allow it', async () => {
@@ -1600,7 +1830,48 @@ describe('testing delete object', () => {
  * DELETE /objects
  * */
 describe('testing deleting multiple objects', () => {
-  test('check if RLS policies are respected: authenticated user is able to delete authenticated resource', async () => {
+  test('authenticated user can bulk delete objects up to the request cap', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectNames = [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map(
+      (i) => `authenticated/bulk-delete-${runId}/${i}`
+    )
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjectNames(seedTx, bucketName, objectNames)
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'DELETE',
+        url: `/object/${bucketName}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          prefixes: objectNames,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      expect(S3Backend.prototype.deleteObjects).toHaveBeenCalled()
+
+      const result = JSON.parse(response.body)
+      expect(result).toHaveLength(MAX_OBJECTS_PER_REQUEST)
+      expect(result.map((row: { name: string }) => row.name)).toEqual(
+        expect.arrayContaining(objectNames)
+      )
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectNames)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
+  })
+
+  test('allows delete requests over the object request cap when hard limits are disabled', async () => {
     const response = await appInstance.inject({
       method: 'DELETE',
       url: '/object/bucket2',
@@ -1608,16 +1879,15 @@ describe('testing deleting multiple objects', () => {
         authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
       },
       payload: {
-        prefixes: [...Array(10001).keys()].map((i) => `authenticated/${i}`),
+        prefixes: [...Array(MAX_OBJECTS_PER_REQUEST + 1).keys()].map(
+          (i) => `authenticated/too-many-${i}`
+        ),
       },
     })
-    expect(response.statusCode).toBe(200)
-    expect(S3Backend.prototype.deleteObjects).toHaveBeenCalled()
 
-    const result = JSON.parse(response.body)
-    expect(result).toHaveLength(10001)
-    expect(result[0].name).toBe('authenticated/0')
-    expect(result[1].name).toBe('authenticated/1')
+    expect(response.statusCode).toBe(200)
+    expect(JSON.parse(response.body)).toEqual([])
+    expect(S3Backend.prototype.deleteObjects).not.toHaveBeenCalled()
   })
 
   test('check if RLS policies are respected: anon user is not able to delete authenticated resource', async () => {
@@ -1806,6 +2076,38 @@ describe('testing generating signed URL', () => {
     })
     expect(response.statusCode).toBe(400)
   })
+
+  test('rejects oversized expiresIn values for signed URLs before jwt signing', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/sign/bucket2/authenticated/cat.jpg',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        expiresIn: 1e21,
+      },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(JSON.parse(response.body).message).toContain('expiresIn')
+  })
+
+  test('rejects expiresIn values above the current runtime maximum for signed URLs', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/sign/bucket2/authenticated/cat.jpg',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        expiresIn: getMaxNumericJWTExpiration() + 10,
+      },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(JSON.parse(response.body).message).toContain('expiresIn')
+  })
 })
 
 /**
@@ -1828,14 +2130,7 @@ describe('testing generating signed URL for upload', () => {
     expect(result.url).toBeTruthy()
     // Ensure that row does not exist in database.
     const db = await getSuperuserPostgrestClient()
-    const objectResponse = await db
-      .from<Obj>('objects')
-      .select('*')
-      .where({
-        name: OBJECT_NAME,
-        bucket_id: BUCKET_ID,
-      })
-      .first()
+    const objectResponse = await findObject(db, BUCKET_ID, OBJECT_NAME)
     expect(objectResponse).toBe(undefined)
   })
 
@@ -1860,14 +2155,7 @@ describe('testing generating signed URL for upload', () => {
     )
     // Ensure that row does not exist in database.
     const db = await getSuperuserPostgrestClient()
-    const objectResponse = await db
-      .from<Obj>('objects')
-      .select('*')
-      .where({
-        name: OBJECT_NAME,
-        bucket_id: BUCKET_ID,
-      })
-      .first()
+    const objectResponse = await findObject(db, BUCKET_ID, OBJECT_NAME)
     expect(objectResponse).toBe(undefined)
   })
 
@@ -1930,7 +2218,11 @@ describe('testing uploading with generated signed upload URL', () => {
     const urlToSign = `${BUCKET_ID}/${OBJECT_NAME}`
     const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
 
-    const jwtToken = await signJWT({ owner, url: urlToSign }, jwtSecret, 100)
+    const jwtToken = await signJWT(
+      { owner, url: urlToSign, scope: SIGNED_URL_SCOPE_UPLOAD },
+      jwtSecret,
+      100
+    )
     const response = await appInstance.inject({
       method: 'PUT',
       url: `/object/upload/sign/${urlToSign}?token=${jwtToken}`,
@@ -1942,25 +2234,12 @@ describe('testing uploading with generated signed upload URL', () => {
 
     // check that row has neccessary data
     const db = await getSuperuserPostgrestClient()
-    const objectResponse = await db
-      .from<Obj>('objects')
-      .select('*')
-      .where({
-        name: OBJECT_NAME,
-        bucket_id: BUCKET_ID,
-      })
-      .first()
+    const objectResponse = await findObject(db, BUCKET_ID, OBJECT_NAME)
     expect(objectResponse?.owner).toBe(owner)
 
     // remove row to not to break other tests
     await withDeleteEnabled(db, async (db) => {
-      await db
-        .from<Obj>('objects')
-        .where({
-          name: OBJECT_NAME,
-          bucket_id: BUCKET_ID,
-        })
-        .delete()
+      await deleteObjectsByName(db, BUCKET_ID, OBJECT_NAME)
     })
   })
 
@@ -1998,6 +2277,90 @@ describe('testing uploading with generated signed upload URL', () => {
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
 
+  test('rejects a download-scoped token on the upload endpoint', async () => {
+    const form = new FormData()
+    form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+    const headers = Object.assign({}, form.getHeaders(), {
+      'content-type': 'image/jpeg',
+    })
+
+    const urlToSign = `bucket2/public/sadcat-upload1.png`
+    // A token minted by the download-signing flow must not be replayable to upload
+    const downloadToken = await signJWT(
+      { url: urlToSign, scope: SIGNED_URL_SCOPE_DOWNLOAD },
+      jwtSecret,
+      100
+    )
+
+    const response = await appInstance.inject({
+      method: 'PUT',
+      url: `/object/upload/sign/${urlToSign}?token=${downloadToken}`,
+      headers,
+      payload: form,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toMatchObject({ error: ErrorCode.InvalidSignature })
+    expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+  })
+
+  test('rejects a legacy download-shaped token (no upsert) on the upload endpoint', async () => {
+    const form = new FormData()
+    form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+    const headers = Object.assign({}, form.getHeaders(), {
+      'content-type': 'image/jpeg',
+    })
+
+    const urlToSign = `bucket2/public/sadcat-upload1.png`
+    const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+    // No scope claim and no `upsert` claim — i.e. a download-shaped token — is rejected,
+    // even though it predates scoping. Only legacy *upload* tokens (with upsert) are honored.
+    const unscopedToken = await signJWT({ owner, url: urlToSign }, jwtSecret, 100)
+
+    const response = await appInstance.inject({
+      method: 'PUT',
+      url: `/object/upload/sign/${urlToSign}?token=${unscopedToken}`,
+      headers,
+      payload: form,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toMatchObject({ error: ErrorCode.InvalidSignature })
+    expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+  })
+
+  test('accepts a legacy upload token (no scope, with upsert) for backward compatibility', async () => {
+    const form = new FormData()
+    form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+    const headers = Object.assign({}, form.getHeaders(), {
+      'content-type': 'image/jpeg',
+    })
+
+    const BUCKET_ID = 'bucket2'
+    const OBJECT_NAME = 'public/sadcat-legacy-upload.png'
+    const urlToSign = `${BUCKET_ID}/${OBJECT_NAME}`
+    const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+    // Token shaped exactly like one minted before scoping existed: owner + url + upsert, no scope
+    const legacyUploadToken = await signJWT(
+      { owner, url: urlToSign, upsert: false },
+      jwtSecret,
+      100
+    )
+
+    const response = await appInstance.inject({
+      method: 'PUT',
+      url: `/object/upload/sign/${urlToSign}?token=${legacyUploadToken}`,
+      headers,
+      payload: form,
+    })
+    expect(response.statusCode).toBe(200)
+    expect(S3Backend.prototype.uploadObject).toHaveBeenCalled()
+
+    // cleanup so the test can be re-run against the same dataset
+    const db = await getSuperuserPostgrestClient()
+    await withDeleteEnabled(db, async (db) => {
+      await deleteObjectsByName(db, BUCKET_ID, OBJECT_NAME)
+    })
+  })
+
   test('upload object with an expired JWT', async () => {
     const form = new FormData()
     form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
@@ -2010,7 +2373,11 @@ describe('testing uploading with generated signed upload URL', () => {
     const urlToSign = `${BUCKET_ID}/${OBJECT_NAME}`
     const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
 
-    const jwtToken = await signJWT({ owner, url: urlToSign }, jwtSecret, -1)
+    const jwtToken = await signJWT(
+      { owner, url: urlToSign, scope: SIGNED_URL_SCOPE_UPLOAD },
+      jwtSecret,
+      '-1s'
+    )
     const response = await appInstance.inject({
       method: 'PUT',
       url: `/object/upload/sign/${urlToSign}?token=${jwtToken}`,
@@ -2018,6 +2385,43 @@ describe('testing uploading with generated signed upload URL', () => {
       payload: form,
     })
     expect(response.statusCode).toBe(400)
+    expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
+  })
+
+  test('upload object with a tampered signed upload token', async () => {
+    const form = new FormData()
+    form.append('file', fs.createReadStream(`./src/test/assets/sadcat.jpg`))
+    const headers = Object.assign({}, form.getHeaders(), {
+      'content-type': 'image/jpeg',
+    })
+
+    const BUCKET_ID = 'bucket2'
+    const OBJECT_NAME = 'public/sadcat-upload1.png'
+    const urlToSign = `${BUCKET_ID}/${OBJECT_NAME}`
+    const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+    const jwtToken = await signJWT(
+      { owner, url: urlToSign, scope: SIGNED_URL_SCOPE_UPLOAD },
+      jwtSecret,
+      100
+    )
+    const signatureStart = jwtToken.lastIndexOf('.') + 1
+    const signatureChar = jwtToken[signatureStart]
+    const tamperedToken = `${jwtToken.slice(0, signatureStart)}${
+      signatureChar === 'a' ? 'b' : 'a'
+    }${jwtToken.slice(signatureStart + 1)}`
+
+    const response = await appInstance.inject({
+      method: 'PUT',
+      url: `/object/upload/sign/${urlToSign}?token=${tamperedToken}`,
+      headers,
+      payload: form,
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toMatchObject({
+      statusCode: '400',
+      error: ErrorCode.InvalidJWT,
+    })
     expect(S3Backend.prototype.uploadObject).not.toHaveBeenCalled()
   })
 
@@ -2090,7 +2494,11 @@ describe('testing uploading with generated signed upload URL', () => {
 
     expect(resp.statusCode).toBe(200)
 
-    const jwtToken = await signJWT({ owner, url: urlToSign }, jwtSecret, 100)
+    const jwtToken = await signJWT(
+      { owner, url: urlToSign, scope: SIGNED_URL_SCOPE_UPLOAD },
+      jwtSecret,
+      100
+    )
     const response = await appInstance.inject({
       method: 'PUT',
       url: `/object/upload/sign/${urlToSign}?token=${jwtToken}`,
@@ -2113,12 +2521,54 @@ describe('testing generating signed URLs', () => {
       },
       payload: {
         expiresIn: 1000,
-        paths: [...Array(10001).keys()].map((i) => `authenticated/${i}`),
+        paths: [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map((i) => `authenticated/${i}`),
       },
     })
     expect(response.statusCode).toBe(200)
     const result = JSON.parse(response.body)
-    expect(result).toHaveLength(10001)
+    expect(result).toHaveLength(MAX_OBJECTS_PER_REQUEST)
+  })
+
+  test('authenticated user can sign URLs up to the request cap', async () => {
+    const runId = randomUUID()
+    const bucketName = 'bucket2'
+    const objectNames = [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map(
+      (i) => `authenticated/bulk-sign-${runId}/${i}`
+    )
+
+    const seedTx = await getSuperuserPostgrestClient()
+    await insertObjectNames(seedTx, bucketName, objectNames)
+    await seedTx.commit()
+    tnx = undefined
+
+    try {
+      const response = await appInstance.inject({
+        method: 'POST',
+        url: `/object/sign/${bucketName}`,
+        headers: {
+          authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+        },
+        payload: {
+          expiresIn: 1000,
+          paths: objectNames,
+        },
+      })
+      expect(response.statusCode).toBe(200)
+      const result = JSON.parse(response.body) as SignedUrlResult[]
+      expect(result).toHaveLength(MAX_OBJECTS_PER_REQUEST)
+      expect(
+        result.every(({ error, signedURL }) => {
+          return error === null && signedURL !== null
+        })
+      ).toBe(true)
+    } finally {
+      const cleanupTx = await getSuperuserPostgrestClient()
+      await withDeleteEnabled(cleanupTx, async (db) => {
+        await deleteObjectsByName(db, bucketName, objectNames)
+      })
+      await cleanupTx.commit()
+      tnx = undefined
+    }
   })
 
   test('check if RLS policies are respected: anon user is not able to generate signedURLs for authenticated resource', async () => {
@@ -2130,7 +2580,7 @@ describe('testing generating signed URLs', () => {
       },
       payload: {
         expiresIn: 1000,
-        paths: [...Array(10001).keys()].map((i) => `authenticated/${i}`),
+        paths: [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map((i) => `authenticated/${i}`),
       },
     })
     expect(response.statusCode).toBe(200)
@@ -2144,9 +2594,27 @@ describe('testing generating signed URLs', () => {
       url: '/object/sign/bucket2',
       payload: {
         expiresIn: 1000,
-        paths: [...Array(10001).keys()].map((i) => `authenticated/${i}`),
+        paths: [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map((i) => `authenticated/${i}`),
       },
     })
+    expect(response.statusCode).toBe(400)
+  })
+
+  test('rejects signed URL requests over the object request cap', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/sign/bucket2',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        expiresIn: 1000,
+        paths: [...Array(MAX_OBJECTS_PER_REQUEST + 1).keys()].map(
+          (i) => `authenticated/too-many-${i}`
+        ),
+      },
+    })
+
     expect(response.statusCode).toBe(400)
   })
 
@@ -2159,7 +2627,7 @@ describe('testing generating signed URLs', () => {
       },
       payload: {
         expiresIn: 1000,
-        paths: [...Array(10001).keys()].map((i) => `authenticated/${i}`),
+        paths: [...Array(MAX_OBJECTS_PER_REQUEST).keys()].map((i) => `authenticated/${i}`),
       },
     })
     expect(response.statusCode).toBe(200)
@@ -2183,12 +2651,61 @@ describe('testing generating signed URLs', () => {
     const result = JSON.parse(response.body)
     expect(result[0].error).toBe('Either the object does not exist or you do not have access to it')
   })
+
+  test('rejects oversized expiresIn values for batch signed URLs before jwt signing', async () => {
+    const response = await appInstance.inject({
+      method: 'POST',
+      url: '/object/sign/bucket2',
+      headers: {
+        authorization: `Bearer ${process.env.AUTHENTICATED_KEY}`,
+      },
+      payload: {
+        expiresIn: 1e21,
+        paths: ['authenticated/cat.jpg'],
+      },
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(JSON.parse(response.body).message).toContain('expiresIn')
+  })
 })
 
 /**
  * GET /public/
  */
 // these tests are written in bucket.test.ts since its easier
+
+/**
+ * signObjectUrl payload hardening (signing-oracle defense)
+ */
+describe('signObjectUrl token claim hardening', () => {
+  const h = useStorage()
+
+  test('attacker-controlled metadata cannot override url/scope or inject upload claims', async () => {
+    const objectName = 'public/sadcat-upload.png'
+    const signedURL = await h.storage
+      .from('bucket2')
+      .signObjectUrl(objectName, `/object/sign/bucket2/${objectName}`, 100, {
+        // a future caller passing these must never be able to forge the token
+        url: 'other-bucket/secret.png',
+        scope: SIGNED_URL_SCOPE_UPLOAD,
+        role: 'service_role',
+        upsert: true,
+        owner: 'attacker',
+      } as never)
+
+    const token = signedURL.split('?token=').pop() as string
+    const payload = (await verifyJWT(token, jwtSecret)) as Record<string, unknown>
+
+    // url stays pinned to the real object path, scope stays 'download'
+    expect(payload.url).toBe(`bucket2/${objectName}`)
+    expect(payload.scope).toBe(SIGNED_URL_SCOPE_DOWNLOAD)
+    // role and the upload-discriminating claims are stripped entirely
+    expect(payload.role).toBeUndefined()
+    expect(payload.upsert).toBeUndefined()
+    expect(payload.owner).toBeUndefined()
+  })
+})
 
 /**
  * GET /sign/
@@ -2223,7 +2740,7 @@ describe('testing retrieving signed URL', () => {
   })
 
   test('forward 304 and If-Modified-Since/If-None-Match headers', async () => {
-    const mockGetObject = jest.spyOn(S3Backend.prototype, 'getObject')
+    const mockGetObject = vi.spyOn(S3Backend.prototype, 'getObject')
     mockGetObject.mockRejectedValue({
       $metadata: {
         httpStatusCode: 304,
@@ -2244,6 +2761,51 @@ describe('testing retrieving signed URL', () => {
       ifModifiedSince: 'Thu, 12 Aug 2021 16:00:00 GMT',
       ifNoneMatch: 'abc',
     })
+  })
+
+  test('rejects an upload-scoped token on the download endpoint', async () => {
+    const urlToSign = 'bucket2/public/sadcat-upload.png'
+    const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+    // A token minted by the upload-signing flow must not be replayable to download
+    const uploadToken = await signJWT(
+      { owner, url: urlToSign, upsert: false, scope: SIGNED_URL_SCOPE_UPLOAD },
+      jwtSecret,
+      100
+    )
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: `/object/sign/${urlToSign}?token=${uploadToken}`,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json<{ error: string }>().error).toBe('InvalidSignature')
+  })
+
+  test('still serves a legacy unscoped download token', async () => {
+    const urlToSign = 'bucket2/public/sadcat-upload.png'
+    // Tokens issued before scoping existed (no scope claim, no upsert) remain valid for download
+    const legacyToken = await signJWT({ url: urlToSign }, jwtSecret, 100)
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: `/object/sign/${urlToSign}?token=${legacyToken}`,
+    })
+    expect(response.statusCode).toBe(200)
+  })
+
+  test('rejects a legacy upload-shaped token (with upsert) on the download endpoint', async () => {
+    const urlToSign = 'bucket2/public/sadcat-upload.png'
+    const owner = '317eadce-631a-4429-a0bb-f19a7a517b4a'
+    // A legacy upload token (no scope, but carrying upsert) must not be replayable to read
+    const legacyUploadToken = await signJWT(
+      { owner, url: urlToSign, upsert: false },
+      jwtSecret,
+      100
+    )
+    const response = await appInstance.inject({
+      method: 'GET',
+      url: `/object/sign/${urlToSign}?token=${legacyUploadToken}`,
+    })
+    expect(response.statusCode).toBe(400)
+    expect(response.json<{ error: string }>().error).toBe('InvalidSignature')
   })
 
   test('get object with incorrect url in jwt', async () => {
@@ -2276,7 +2838,7 @@ describe('testing retrieving signed URL', () => {
 
   test('get object with an expired JWT', async () => {
     const urlToSign = 'bucket2/public/sadcat-upload.png'
-    const expiredJWT = await signJWT({ url: urlToSign }, jwtSecret, -1)
+    const expiredJWT = await signJWT({ url: urlToSign }, jwtSecret, '-1s')
     const response = await appInstance.inject({
       method: 'GET',
       url: `/object/sign/${urlToSign}?token=${expiredJWT}`,
@@ -2287,6 +2849,7 @@ describe('testing retrieving signed URL', () => {
 
 describe('testing move object', () => {
   test('check if RLS policies are respected: authenticated user is able to move an authenticated object', async () => {
+    const objectAdminDeleteSendSpy = vi.spyOn(ObjectAdminDelete, 'send')
     const response = await appInstance.inject({
       method: 'POST',
       url: `/object/move`,
@@ -2301,10 +2864,11 @@ describe('testing move object', () => {
     })
     expect(response.statusCode).toBe(200)
     expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
-    expect(S3Backend.prototype.deleteObjects).toHaveBeenCalled()
+    expect(objectAdminDeleteSendSpy).toHaveBeenCalled()
   })
 
   test('can move objects across buckets respecting RLS', async () => {
+    const objectAdminDeleteSendSpy = vi.spyOn(ObjectAdminDelete, 'send')
     const response = await appInstance.inject({
       method: 'POST',
       url: `/object/move`,
@@ -2320,7 +2884,7 @@ describe('testing move object', () => {
     })
     expect(response.statusCode).toBe(200)
     expect(S3Backend.prototype.copyObject).toHaveBeenCalled()
-    expect(S3Backend.prototype.deleteObjects).toHaveBeenCalled()
+    expect(objectAdminDeleteSendSpy).toHaveBeenCalled()
   })
 
   test('cross-bucket move rollback should cleanup destination bucket object', async () => {
@@ -2328,10 +2892,10 @@ describe('testing move object', () => {
     const sourceKey = `authenticated/move-orig-rollback-${runId}.png`
     const destinationKey = `authenticated/move-new-rollback-${runId}.png`
     const destinationBucket = 'bucket3'
-    const objectAdminDeleteSendSpy = jest.spyOn(ObjectAdminDelete, 'send')
+    const objectAdminDeleteSendSpy = vi.spyOn(ObjectAdminDelete, 'send')
 
     const seedTx = await getSuperuserPostgrestClient()
-    await seedTx.from<Obj>('objects').insert({
+    await insertObjects(seedTx, {
       bucket_id: 'bucket2',
       name: sourceKey,
       owner: '317eadce-631a-4429-a0bb-f19a7a517b4a',
@@ -2341,9 +2905,9 @@ describe('testing move object', () => {
     await seedTx.commit()
     tnx = undefined
 
-    jest
-      .spyOn(S3Backend.prototype, 'headObject')
-      .mockRejectedValueOnce(new Error('forced move failure'))
+    vi.spyOn(S3Backend.prototype, 'headObject').mockRejectedValueOnce(
+      new Error('forced move failure')
+    )
 
     const response = await appInstance.inject({
       method: 'POST',
@@ -2660,7 +3224,8 @@ describe('testing list objects', () => {
     const objectNames = [`percent-${runId}/first.txt`, `percent-${runId}/second.txt`]
 
     const seedTx = await getSuperuserPostgrestClient()
-    await seedTx.from<Obj>('objects').insert(
+    await insertObjects(
+      seedTx,
       objectNames.map((name, idx) => ({
         bucket_id: bucketName,
         name,
@@ -2700,11 +3265,7 @@ describe('testing list objects', () => {
     } finally {
       const cleanupTx = await getSuperuserPostgrestClient()
       await withDeleteEnabled(cleanupTx, async (db) => {
-        await db
-          .from<Obj>('objects')
-          .where({ bucket_id: bucketName })
-          .whereIn('name', objectNames)
-          .delete()
+        await deleteObjectsByName(db, bucketName, objectNames)
       })
       await cleanupTx.commit()
       tnx = undefined
@@ -2718,7 +3279,7 @@ describe('testing list objects', () => {
     const wildcardOnlyMatch = `wildX${runId}/miss.txt`
 
     const seedTx = await getSuperuserPostgrestClient()
-    await seedTx.from<Obj>('objects').insert([
+    await insertObjects(seedTx, [
       {
         bucket_id: bucketName,
         name: literalMatch,
@@ -2769,11 +3330,7 @@ describe('testing list objects', () => {
     } finally {
       const cleanupTx = await getSuperuserPostgrestClient()
       await withDeleteEnabled(cleanupTx, async (db) => {
-        await db
-          .from<Obj>('objects')
-          .where({ bucket_id: bucketName })
-          .whereIn('name', [literalMatch, wildcardOnlyMatch])
-          .delete()
+        await deleteObjectsByName(db, bucketName, [literalMatch, wildcardOnlyMatch])
       })
       await cleanupTx.commit()
       tnx = undefined

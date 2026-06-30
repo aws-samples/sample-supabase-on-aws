@@ -1,5 +1,3 @@
-'use strict'
-
 import { DatabaseError } from 'pg'
 import { useStorage, withDeleteEnabled } from './utils/storage'
 
@@ -24,12 +22,15 @@ describe('Database Protection Triggers', () => {
       const testBucket = `temp-bucket-${Date.now()}`
 
       // Create a test bucket
-      await db.raw('INSERT INTO storage.buckets (id, name) VALUES (?, ?)', [testBucket, testBucket])
+      await db.query('INSERT INTO storage.buckets (id, name) VALUES ($1, $2)', [
+        testBucket,
+        testBucket,
+      ])
 
       // Attempt to delete without setting storage.allow_delete_query
       try {
-        await db.raw('DELETE FROM storage.buckets WHERE id = ?', [testBucket])
-        fail('Expected DELETE to be blocked by trigger')
+        await db.query('DELETE FROM storage.buckets WHERE id = $1', [testBucket])
+        throw new Error('Expected DELETE to be blocked by trigger')
       } catch (error) {
         const dbError = error as DatabaseError
         expect(dbError.code).toBe('42501') // PostgreSQL error code for insufficient privilege
@@ -37,12 +38,12 @@ describe('Database Protection Triggers', () => {
       }
 
       // Verify bucket still exists
-      const result = await db.raw('SELECT id FROM storage.buckets WHERE id = ?', [testBucket])
+      const result = await db.query('SELECT id FROM storage.buckets WHERE id = $1', [testBucket])
       expect(result.rows).toHaveLength(1)
 
       // Cleanup: delete with proper config
       await withDeleteEnabled(db, async (db) => {
-        await db.raw('DELETE FROM storage.buckets WHERE id = ?', [testBucket])
+        await db.query('DELETE FROM storage.buckets WHERE id = $1', [testBucket])
       })
     })
 
@@ -51,18 +52,18 @@ describe('Database Protection Triggers', () => {
       const testObjectName = `test-object-${Date.now()}.txt`
 
       // Create a test object
-      await db.raw(
-        'INSERT INTO storage.objects (bucket_id, name, owner, version) VALUES (?, ?, ?, ?)',
+      await db.query(
+        'INSERT INTO storage.objects (bucket_id, name, owner, version) VALUES ($1, $2, $3, $4)',
         [testBucketName, testObjectName, null, '1']
       )
 
       // Attempt to delete without setting storage.allow_delete_query
       try {
-        await db.raw('DELETE FROM storage.objects WHERE bucket_id = ? AND name = ?', [
+        await db.query('DELETE FROM storage.objects WHERE bucket_id = $1 AND name = $2', [
           testBucketName,
           testObjectName,
         ])
-        fail('Expected DELETE to be blocked by trigger')
+        throw new Error('Expected DELETE to be blocked by trigger')
       } catch (error) {
         const dbError = error as DatabaseError
         expect(dbError.code).toBe('42501')
@@ -70,15 +71,15 @@ describe('Database Protection Triggers', () => {
       }
 
       // Verify object still exists
-      const result = await db.raw(
-        'SELECT name FROM storage.objects WHERE bucket_id = ? AND name = ?',
+      const result = await db.query(
+        'SELECT name FROM storage.objects WHERE bucket_id = $1 AND name = $2',
         [testBucketName, testObjectName]
       )
       expect(result.rows).toHaveLength(1)
 
       // Cleanup: delete with proper config
       await withDeleteEnabled(db, async (db) => {
-        await db.raw('DELETE FROM storage.objects WHERE bucket_id = ? AND name = ?', [
+        await db.query('DELETE FROM storage.objects WHERE bucket_id = $1 AND name = $2', [
           testBucketName,
           testObjectName,
         ])
@@ -91,16 +92,16 @@ describe('Database Protection Triggers', () => {
 
       await withDeleteEnabled(db, async (db) => {
         // Create a test bucket
-        await db.raw('INSERT INTO storage.buckets (id, name) VALUES (?, ?)', [
+        await db.query('INSERT INTO storage.buckets (id, name) VALUES ($1, $2)', [
           testBucket,
           testBucket,
         ])
 
         // Delete with proper config should succeed
-        await db.raw('DELETE FROM storage.buckets WHERE id = ?', [testBucket])
+        await db.query('DELETE FROM storage.buckets WHERE id = $1', [testBucket])
 
         // Verify bucket is deleted
-        const result = await db.raw('SELECT id FROM storage.buckets WHERE id = ?', [testBucket])
+        const result = await db.query('SELECT id FROM storage.buckets WHERE id = $1', [testBucket])
         expect(result.rows).toHaveLength(0)
       })
     })
@@ -111,20 +112,20 @@ describe('Database Protection Triggers', () => {
 
       await withDeleteEnabled(db, async (db) => {
         // Create a test object
-        await db.raw(
-          'INSERT INTO storage.objects (bucket_id, name, owner, version) VALUES (?, ?, ?, ?)',
+        await db.query(
+          'INSERT INTO storage.objects (bucket_id, name, owner, version) VALUES ($1, $2, $3, $4)',
           [testBucketName, testObjectName, null, '1']
         )
 
         // Delete with proper config should succeed
-        await db.raw('DELETE FROM storage.objects WHERE bucket_id = ? AND name = ?', [
+        await db.query('DELETE FROM storage.objects WHERE bucket_id = $1 AND name = $2', [
           testBucketName,
           testObjectName,
         ])
 
         // Verify object is deleted
-        const result = await db.raw(
-          'SELECT name FROM storage.objects WHERE bucket_id = ? AND name = ?',
+        const result = await db.query(
+          'SELECT name FROM storage.objects WHERE bucket_id = $1 AND name = $2',
           [testBucketName, testObjectName]
         )
         expect(result.rows).toHaveLength(0)

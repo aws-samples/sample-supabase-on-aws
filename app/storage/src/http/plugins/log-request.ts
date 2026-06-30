@@ -1,10 +1,20 @@
-import { logger, logSchema, redactQueryParamFromRequest } from '@internal/monitoring'
-import { FastifyReply } from 'fastify/types/reply'
-import { FastifyRequest } from 'fastify/types/request'
+import { logSchema, serializeReplyLog, serializeRequestLog } from '@internal/monitoring'
+import type { FastifyReply, FastifyRequest } from 'fastify'
 import fastifyPlugin from 'fastify-plugin'
 
 interface RequestLoggerOptions {
   excludeUrls?: string[]
+}
+
+type BivariantHandler<Args extends unknown[], Return> = {
+  bivarianceHack(...args: Args): Return
+}['bivarianceHack']
+
+declare module 'http' {
+  interface IncomingMessage {
+    executionError?: Error
+    resources?: string[]
+  }
 }
 
 declare module 'fastify' {
@@ -18,8 +28,8 @@ declare module 'fastify' {
 
   interface FastifyContextConfig {
     operation?: { type: string }
-    resources?: (req: FastifyRequest<any>) => string[]
-    logMetadata?: (req: FastifyRequest<any>) => Record<string, unknown>
+    resources?: BivariantHandler<[req: FastifyRequest], string[]>
+    logMetadata?: BivariantHandler<[req: FastifyRequest], Record<string, unknown>>
   }
 }
 
@@ -30,7 +40,7 @@ declare module 'fastify' {
 export const logRequest = (options: RequestLoggerOptions) =>
   fastifyPlugin(
     async (fastify) => {
-      fastify.addHook('onRequest', async (req, res) => {
+      fastify.addHook('onRequest', (req, res, done) => {
         req.startTime = Date.now()
 
         res.raw.once('close', () => {
@@ -51,12 +61,13 @@ export const logRequest = (options: RequestLoggerOptions) =>
             })
           }
         })
+        done()
       })
 
       /**
        * Adds req.resources and req.operation to the request object
        */
-      fastify.addHook('preHandler', async (req) => {
+      fastify.addHook('preHandler', (req, _reply, done) => {
         let resources = req.resources
 
         if (resources === undefined) {
@@ -64,30 +75,11 @@ export const logRequest = (options: RequestLoggerOptions) =>
         }
 
         if (resources === undefined) {
-          resources = (req.raw as any).resources
+          resources = req.raw.resources
         }
 
         if (resources === undefined) {
-          const params = req.params as Record<string, unknown> | undefined
-          let resourceFromParams = ''
-
-          if (params) {
-            let first = true
-            for (const key in params) {
-              if (!Object.prototype.hasOwnProperty.call(params, key)) {
-                continue
-              }
-
-              if (!first) {
-                resourceFromParams += '/'
-              }
-
-              const value = params[key]
-              resourceFromParams += value == null ? '' : String(value)
-              first = false
-            }
-          }
-
+          const resourceFromParams = getResourceFromParams(req.params)
           resources = resourceFromParams ? [resourceFromParams] : []
         }
 
@@ -106,14 +98,15 @@ export const logRequest = (options: RequestLoggerOptions) =>
         if (req.operation && typeof req.opentelemetry === 'function') {
           req.opentelemetry()?.span?.setAttribute('http.operation', req.operation.type)
         }
+        done()
       })
 
-      fastify.addHook('onSend', async (req, _, payload) => {
+      fastify.addHook('onSend', (req, _reply, payload, done) => {
         req.executionTime = Date.now() - req.startTime
-        return payload
+        done(null, payload)
       })
 
-      fastify.addHook('onResponse', async (req, reply) => {
+      fastify.addHook('onResponse', (req, reply, done) => {
         doRequestLog(req, {
           reply,
           excludeUrls: options.excludeUrls,
@@ -121,6 +114,7 @@ export const logRequest = (options: RequestLoggerOptions) =>
           responseTime: reply.elapsedTime,
           executionTime: req.executionTime,
         })
+        done()
       })
     },
     { name: 'log-request' }
@@ -139,18 +133,15 @@ function doRequestLog(req: FastifyRequest, options: LogRequestOptions) {
     return
   }
 
-  const rMeth = req.method
-  const rUrl = redactQueryParamFromRequest(req, [
-    'token',
-    'X-Amz-Credential',
-    'X-Amz-Signature',
-    'X-Amz-Security-Token',
-  ])
+  const requestLog = serializeRequestLog(req)
+  const replyLog = serializeReplyLog(options.reply)
+  const rMeth = requestLog.method
+  const rUrl = requestLog.url
   const uAgent = req.headers['user-agent']
   const rId = req.id
   const cIP = req.ip
   const statusCode = options.statusCode
-  const error = (req.raw as any).executionError || req.executionError
+  const error = req.raw.executionError || req.executionError
   const tenantId = req.tenantId
 
   let reqMetadata: Record<string, unknown> = {}
@@ -166,15 +157,23 @@ function doRequestLog(req: FastifyRequest, options: LogRequestOptions) {
           }
         } catch (e) {
           // do nothing
-          logSchema.warning(logger, 'Failed to serialize log metadata', {
+          logSchema.warning(req.log, 'Failed to serialize log metadata', {
             type: 'otel',
+            tenantId,
+            project: tenantId,
+            reqId: rId,
+            sbReqId: req.sbReqId,
             error: e,
           })
         }
       }
     } catch (e) {
-      logSchema.error(logger, 'Failed to get log metadata', {
+      logSchema.error(req.log, 'Failed to get log metadata', {
         type: 'request',
+        tenantId,
+        project: tenantId,
+        reqId: rId,
+        sbReqId: req.sbReqId,
         error: e,
       })
     }
@@ -184,9 +183,13 @@ function doRequestLog(req: FastifyRequest, options: LogRequestOptions) {
 
   logSchema.request(req.log, buildLogMessage, {
     type: 'request',
-    req,
+    tenantId,
+    project: tenantId,
+    reqId: rId,
+    sbReqId: req.sbReqId,
+    req: requestLog,
     reqMetadata,
-    res: options.reply,
+    res: replyLog,
     responseTime: options.responseTime,
     executionTime: options.executionTime,
     error,
@@ -196,4 +199,29 @@ function doRequestLog(req: FastifyRequest, options: LogRequestOptions) {
     operation: req.operation?.type ?? req.routeOptions.config.operation?.type,
     serverTimes: req.serverTimings,
   })
+}
+
+function getResourceFromParams(params: unknown): string {
+  if (!params || typeof params !== 'object') {
+    return ''
+  }
+
+  let resource = ''
+  let first = true
+
+  for (const key in params) {
+    if (!Object.prototype.hasOwnProperty.call(params, key)) {
+      continue
+    }
+
+    if (!first) {
+      resource += '/'
+    }
+
+    const value = (params as Record<string, unknown>)[key]
+    resource += value == null ? '' : String(value)
+    first = false
+  }
+
+  return resource
 }

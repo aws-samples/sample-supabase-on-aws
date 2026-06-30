@@ -1,7 +1,10 @@
 import { AsyncAbortController } from '@internal/concurrency'
-import { multitenantKnex, TenantConnection } from '@internal/database'
+import { PgTenantConnection, shutdownMultitenantPg } from '@internal/database'
 import { logger, logSchema } from '@internal/monitoring'
 import http from 'http'
+
+let shutdownPromise: Promise<void> | undefined
+const shutdownPhaseTimeoutMs = 60_000
 
 /**
  * Binds shutdown handlers to the process
@@ -55,44 +58,55 @@ export function bindShutdownSignals(serverSignal: AsyncAbortController) {
  * @param serverSignal
  */
 export async function shutdown(serverSignal: AsyncAbortController) {
-  try {
-    const errors: unknown[] = []
-
-    await serverSignal.abortAsync().catch((e) => {
-      logSchema.error(logger, 'Failed to abort server signal', {
-        type: 'shutdown',
-        error: e,
-      })
-      errors.push(e)
-    })
-
-    await multitenantKnex.destroy().catch((e) => {
-      logSchema.error(logger, 'Failed to close database connection', {
-        type: 'shutdown',
-        error: e,
-      })
-      errors.push(e)
-    })
-
-    await TenantConnection.stop().catch((e) => {
-      logSchema.error(logger, 'Failed to close tenant connection', {
-        type: 'shutdown',
-        error: e,
-      })
-    })
-
-    if (errors.length > 0) {
-      throw errors[errors.length - 1]
-    }
-  } catch (e) {
-    logSchema.error(logger, 'shutdown error', {
-      type: 'shutdown',
-      error: e,
-    })
-    throw e
-  } finally {
-    logger.flush()
+  if (shutdownPromise) {
+    return shutdownPromise
   }
+
+  shutdownPromise = (async () => {
+    try {
+      const errors: unknown[] = []
+
+      await runShutdownPhase('abort server signal', () => serverSignal.abortAsync()).catch((e) => {
+        logSchema.error(logger, 'Failed to abort server signal', {
+          type: 'shutdown',
+          error: e,
+        })
+        errors.push(e)
+      })
+
+      await runShutdownPhase('close pg tenant connection', () => PgTenantConnection.stop()).catch(
+        (e) => {
+          logSchema.error(logger, 'Failed to close pg tenant connection', {
+            type: 'shutdown',
+            error: e,
+          })
+          errors.push(e)
+        }
+      )
+
+      await runShutdownPhase('close pg database connection', shutdownMultitenantPg).catch((e) => {
+        logSchema.error(logger, 'Failed to shutdown pg database connection', {
+          type: 'shutdown',
+          error: e,
+        })
+        errors.push(e)
+      })
+
+      if (errors.length > 0) {
+        throw errors[errors.length - 1]
+      }
+    } catch (e) {
+      logSchema.error(logger, 'shutdown error', {
+        type: 'shutdown',
+        error: e,
+      })
+      throw e
+    } finally {
+      logger.flush()
+    }
+  })()
+
+  return shutdownPromise
 }
 
 export function createServerClosedPromise(server: http.Server, cb: () => Promise<void> | void) {
@@ -102,4 +116,23 @@ export function createServerClosedPromise(server: http.Server, cb: () => Promise
       res()
     })
   })
+}
+
+async function runShutdownPhase<T>(name: string, phase: () => Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`Shutdown phase "${name}" timed out after ${shutdownPhaseTimeoutMs}ms`))
+    }, shutdownPhaseTimeoutMs)
+    timeout.unref?.()
+  })
+
+  try {
+    return await Promise.race([phase(), timeoutPromise])
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout)
+    }
+  }
 }

@@ -1,4 +1,4 @@
-import { TenantConnection } from '@internal/database'
+import { PgTenantConnection } from '@internal/database'
 import { DBMigration } from '@internal/database/migrations'
 import { ObjectMetadata } from '../backend'
 import { Bucket, IcebergCatalog, Obj, S3MultipartUpload, S3PartUpload } from '../schemas'
@@ -38,11 +38,12 @@ export interface TransactionOptions {
 export interface DatabaseOptions<TNX> {
   tenantId: string
   reqId?: string
+  sbReqId?: string
   latestMigration?: keyof typeof DBMigration
   host: string
   tnx?: TNX
   parentTnx?: TNX
-  parentConnection?: TenantConnection
+  parentConnection?: PgTenantConnection
 }
 
 export interface ListBucketOptions {
@@ -53,23 +54,29 @@ export interface ListBucketOptions {
   search?: string
 }
 
+export interface ScannerS3Key {
+  key: string
+  size: number
+}
+
 export interface Database {
   tenantHost: string
   tenantId: string
   reqId?: string
+  sbReqId?: string
   role?: string
-  connection: TenantConnection
+  connection: PgTenantConnection
 
   tenant(): { ref: string; host: string }
 
   asSuperUser(): Database
 
-  withTransaction<T extends (db: Database) => Promise<any>>(
-    fn: T,
+  withTransaction<T>(
+    fn: (db: Database) => Promise<T>,
     transactionOptions?: TransactionOptions
-  ): Promise<ReturnType<T>>
+  ): Promise<T>
 
-  testPermission<T extends (db: Database) => any>(fn: T): Promise<Awaited<ReturnType<T>>>
+  testPermission<T>(fn: (db: Database) => T | Promise<T>): Promise<Awaited<T>>
 
   createBucket(
     data: Pick<
@@ -149,7 +156,6 @@ export interface Database {
     name: string,
     data: Pick<Obj, 'owner' | 'metadata' | 'version' | 'name' | 'bucket_id' | 'user_metadata'>
   ): Promise<Obj>
-
   createObject(
     data: Pick<Obj, 'name' | 'owner' | 'bucket_id' | 'metadata' | 'version' | 'user_metadata'>
   ): Promise<Obj>
@@ -226,4 +232,14 @@ export interface Database {
     options: ListBucketOptions | undefined
   ): Promise<IcebergCatalog[]>
   findAnalyticsBucketByName(name: string): Promise<IcebergCatalog>
+
+  createS3KeysTempTable(tableName: string): Promise<void>
+  dropS3KeysTempTable(tableName: string): Promise<void>
+  listS3KeysFromTempTable(
+    tableName: string,
+    nextItem: string,
+    limit: number
+  ): Promise<ScannerS3Key[]>
+  findS3KeysInTempTable(tableName: string, keys: string[]): Promise<Pick<ScannerS3Key, 'key'>[]>
+  insertS3KeysIntoTempTable(tableName: string, keys: ScannerS3Key[]): Promise<void>
 }

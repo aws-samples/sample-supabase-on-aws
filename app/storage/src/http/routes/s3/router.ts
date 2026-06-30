@@ -84,9 +84,9 @@ type ResponseType = {
 export type RequestInput<
   S extends Schema,
   A extends {
-    [key in keyof S]: S[key] extends JSONSchema ? FromSchema<S[key]> : undefined
+    [key in keyof S]: S[key] extends JSONSchema ? FromSchema<S[key]> : unknown
   } = {
-    [key in keyof S]: S[key] extends JSONSchema ? FromSchema<S[key]> : undefined
+    [key in keyof S]: S[key] extends JSONSchema ? FromSchema<S[key]> : unknown
   },
 > = {
   Querystring: A['Querystring']
@@ -105,6 +105,11 @@ export type QuerystringMatch = {
   value: string | undefined
 }
 
+export type HeaderMatch = {
+  name: string
+  value?: string
+}
+
 export type RouteQuery = Record<string, string | undefined>
 
 type Route<S extends Schema, Context> = {
@@ -119,10 +124,15 @@ type Route<S extends Schema, Context> = {
   allowEmptyJsonBody?: boolean
   acceptMultiformData?: boolean
   operation: string
-  compiledSchema: () => ValidateFunction<JTDDataType<S>>
+  // Precompiled operation: allocated operation object at registration
+  operationConfig: { type: string }
+  validate: ValidateFunction<JTDDataType<S>>
+  // Precompiled matcher: the query/header criteria are parsed once at registration
+  // time so request-time matching is a single closure call with no string parsing.
+  matches: (type: string | undefined, query: RouteQuery, headers: Record<string, string>) => boolean
 }
 
-interface RouteOptions<S extends JSONSchema> {
+interface RouteOptions<S extends Schema> {
   disableContentTypeParser?: boolean
   allowEmptyJsonBody?: boolean
   acceptMultiformData?: boolean
@@ -131,8 +141,11 @@ interface RouteOptions<S extends JSONSchema> {
   type?: string
 }
 
-export class Router<Context = unknown, S extends Schema = Schema> {
-  protected _routes: Map<string, Route<S, Context>[]> = new Map<string, Route<S, Context>[]>()
+export class Router<Context = unknown> {
+  protected _routes: Map<string, Route<Schema, Context>[]> = new Map<
+    string,
+    Route<Schema, Context>[]
+  >()
 
   protected ajv = new Ajv({
     coerceTypes: 'array',
@@ -143,11 +156,11 @@ export class Router<Context = unknown, S extends Schema = Schema> {
     allErrors: false,
   })
 
-  registerRoute<R extends S = S>(
+  registerRoute(
     method: HTTPMethod,
     url: string,
-    options: RouteOptions<R>,
-    handler: Handler<R, Context>
+    options: RouteOptions<Schema>,
+    handler: Handler<Schema, Context>
   ) {
     const { query, headers } = this.parseRequestInfo(url)
     const normalizedUrl = url.split('?')[0].split('|')[0]
@@ -191,7 +204,8 @@ export class Router<Context = unknown, S extends Schema = Schema> {
       }
     })
 
-    const existingSchema = this.ajv.getSchema(method + url)
+    const schemaKey = method + url
+    const existingSchema = this.ajv.getSchema(schemaKey)
 
     if (!existingSchema) {
       this.ajv.addSchema(
@@ -200,52 +214,61 @@ export class Router<Context = unknown, S extends Schema = Schema> {
           properties: schemaToCompile,
           required: required.filter(Boolean),
         },
-        method + url
+        schemaKey
       )
     }
 
-    const newRoute: Route<R, Context> = {
-      method: method as HTTPMethod,
+    const validate = this.ajv.getSchema(schemaKey) as ValidateFunction<JTDDataType<Schema>>
+
+    const compiledOperation = compileOperation(operation, options.type)
+
+    const newRoute: Route<Schema, Context> = {
+      method,
       path: normalizedUrl,
       querystringMatches: query,
       headersMatches: headers,
       schema,
-      compiledSchema: () => this.ajv.getSchema(method + url) as ValidateFunction<JTDDataType<R>>,
-      handler: handler as Handler<R, Context>,
+      validate,
+      handler,
       disableContentTypeParser,
       allowEmptyJsonBody,
       acceptMultiformData,
-      operation,
+      operation: compiledOperation,
+      operationConfig: { type: compiledOperation },
       type: options.type,
-    } as const
+      matches: compileMatcher(query, headers, options.type),
+    }
 
     if (!existingPath) {
-      this._routes.set(normalizedUrl, [newRoute as unknown as Route<S, Context>])
+      this._routes.set(normalizedUrl, [newRoute])
       return
     }
 
-    existingPath.push(newRoute as unknown as Route<S, Context>)
+    existingPath.push(newRoute)
     this._routes.set(normalizedUrl, existingPath)
   }
 
-  get<R extends S>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
-    this.registerRoute('get', url, options, handler as any)
+  // The deep mapped types in RouteOptions<R> / Handler<R> (JTDDataType, FromSchema)
+  // hit TS2589 when checked against Schema, and Handler is contravariant in R, so the
+  // per-route generic is erased at the call boundary into the schema-agnostic registry.
+  get<R extends Schema>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
+    this.registerRoute('get', url, ...erase<R, Context>(options, handler))
   }
 
-  post<R extends S = S>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
-    this.registerRoute('post', url, options, handler as any)
+  post<R extends Schema>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
+    this.registerRoute('post', url, ...erase<R, Context>(options, handler))
   }
 
-  put<R extends S = S>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
-    this.registerRoute('put', url, options, handler as any)
+  put<R extends Schema>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
+    this.registerRoute('put', url, ...erase<R, Context>(options, handler))
   }
 
-  delete<R extends S = S>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
-    this.registerRoute('delete', url, options, handler as any)
+  delete<R extends Schema>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
+    this.registerRoute('delete', url, ...erase<R, Context>(options, handler))
   }
 
-  head<R extends S = S>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
-    this.registerRoute('head', url, options, handler as any)
+  head<R extends Schema>(url: string, options: RouteOptions<R>, handler: Handler<R, Context>) {
+    this.registerRoute('head', url, ...erase<R, Context>(options, handler))
   }
 
   parseQueryMatch(query: string): QuerystringMatch {
@@ -268,80 +291,116 @@ export class Router<Context = unknown, S extends Schema = Schema> {
   }
 
   matchRoute(
-    route: Route<S, Context>,
-    match: { query: RouteQuery; headers: Record<string, string>; type?: string }
+    route: Route<Schema, Context>,
+    type: string | undefined,
+    query: RouteQuery,
+    headers: Record<string, string>
   ) {
-    const isOfType = match.type ? match.type === route.type : route.type === undefined
+    return route.matches(type, query, headers)
+  }
+}
 
-    if ((route.headersMatches?.length || 0) > 0) {
-      return (
-        this.matchHeaders(route.headersMatches, match.headers) &&
-        this.matchQueryString(route.querystringMatches, match.query) &&
-        isOfType
-      )
+function compileOperation(operation: string, type?: string) {
+  return type ? operation.replaceAll('s3.', `s3.${type}.`) : operation
+}
+
+/**
+ * Precompiles a route's query/header/type criteria into a single matcher closure.
+ *
+ * The query wildcard flag and the header name/value pairs are derived once here
+ * instead of on every request, so request-time matching is a closure call with no
+ * per-request string splitting or array scanning to recompute static information.
+ */
+function compileMatcher(
+  query: QuerystringMatch[],
+  headers: string[],
+  type?: string
+): (
+  matchType: string | undefined,
+  reqQuery: RouteQuery,
+  reqHeaders: Record<string, string>
+) => boolean {
+  const hasWildcardQuery = query.some((match) => match.key === '*')
+  const valuedQueryMatches = query.filter((match) => match.key !== '*')
+  const hasOnlyWildcardQuery = hasWildcardQuery && valuedQueryMatches.length === 0
+  const headerMatches = headers.map(parseHeaderMatch)
+  const hasHeaderMatches = headerMatches.length > 0
+
+  return (
+    matchType: string | undefined,
+    reqQuery: RouteQuery,
+    reqHeaders: Record<string, string>
+  ) => {
+    if (matchType !== type) {
+      return false
     }
 
-    return this.matchQueryString(route.querystringMatches, match.query) && isOfType
+    if (hasHeaderMatches && !matchHeaders(headerMatches, reqHeaders)) {
+      return false
+    }
+
+    if (hasOnlyWildcardQuery) {
+      return true
+    }
+
+    return matchQueryString(valuedQueryMatches, hasWildcardQuery, reqQuery)
+  }
+}
+
+function parseHeaderMatch(header: string): HeaderMatch {
+  const separatorIndex = header.indexOf('=')
+  if (separatorIndex === -1) {
+    return { name: header }
+  }
+  return { name: header.slice(0, separatorIndex), value: header.slice(separatorIndex + 1) }
+}
+
+function matchHeaders(matches: HeaderMatch[], received: Record<string, string>) {
+  for (const match of matches) {
+    const value = received[match.name]
+    if (value === undefined) {
+      return false
+    }
+    if (match.value && !value.startsWith(match.value)) {
+      return false
+    }
   }
 
-  protected matchHeaders(headers: string[], received?: Record<string, string>) {
-    if (!received) {
-      return headers.length === 0
-    }
+  return true
+}
 
-    return headers.every((header) => {
-      const headerParts = header.split('=')
-      const headerName = headerParts[0]
-      const headerValue = headerParts[1]
-
-      const matchHeaderName = received[headerName] !== undefined
-      const matchHeaderValue = headerValue ? received[headerName]?.startsWith(headerValue) : true
-
-      return matchHeaderName && matchHeaderValue
-    })
-  }
-
-  protected matchQueryString(matches: QuerystringMatch[], received?: RouteQuery) {
-    let hasWildcard = false
-    for (const match of matches) {
-      if (match.key === '*') {
-        hasWildcard = true
-        break
-      }
-    }
-
-    if (!received) {
+function matchQueryString(
+  valuedMatches: QuerystringMatch[],
+  hasWildcard: boolean,
+  received: RouteQuery
+) {
+  for (const match of valuedMatches) {
+    if (!(match.key in received)) {
       return hasWildcard
     }
 
-    let hasReceivedQuery = false
-    for (const key in received) {
-      if (Object.prototype.hasOwnProperty.call(received, key)) {
-        hasReceivedQuery = true
-        break
-      }
-    }
-
-    if (!hasReceivedQuery) {
+    if (match.value !== undefined && match.value !== received[match.key]) {
       return hasWildcard
     }
-
-    for (const match of matches) {
-      if (match.key === '*') {
-        continue
-      }
-
-      if (!Object.prototype.hasOwnProperty.call(received, match.key)) {
-        return hasWildcard
-      }
-
-      if (match.value !== undefined && match.value !== received[match.key]) {
-        return hasWildcard
-      }
-    }
-
-    return true
   }
+
+  return true
+}
+
+/**
+ * The per-route generic R is preserved at the public-method call site for inference,
+ * then erased here into the schema-agnostic registry shape. Centralising the casts
+ * avoids both TS2589 (deep instantiation of RouteOptions<R>/Handler<R>) and the
+ * Handler contravariance mismatch in one place.
+ */
+function erase<R extends Schema, Context>(
+  options: RouteOptions<R>,
+  handler: Handler<R, Context>
+): [RouteOptions<Schema>, Handler<Schema, Context>] {
+  return [
+    options as unknown as RouteOptions<Schema>,
+    handler as unknown as Handler<Schema, Context>,
+  ]
 }
 
 /**

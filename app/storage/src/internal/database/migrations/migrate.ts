@@ -1,6 +1,5 @@
 import { ERRORS } from '@internal/errors'
 import { ResetMigrationsOnTenant, RunMigrationsOnTenants } from '@storage/events'
-import { Knex } from 'knex'
 import { Client, ClientConfig } from 'pg'
 import { MigrationError } from 'postgres-migrations'
 import { runMigration } from 'postgres-migrations/dist/run-migration'
@@ -9,10 +8,13 @@ import { validateMigrationHashes } from 'postgres-migrations/dist/validation'
 import SQL from 'sql-template-strings'
 import { getConfig, MultitenantMigrationStrategy } from '../../../config'
 import { logger, logSchema } from '../../monitoring'
-import { multitenantKnex } from '../multitenant-db'
+import { multitenantPgExecutor } from '../multitenant-pg'
+import { PgExecutor, PgTransaction } from '../pg-connection'
 import { searchPath } from '../pool'
 import { getSslSettings } from '../ssl'
 import { getTenantConfig, TenantMigrationStatus } from '../tenant'
+import { TenantConfigStorePg } from '../tenant-store-pg'
+import { deriveVectorDatabaseUrl, VECTOR_DATABASE_NAME } from '../vector-store-url'
 import { lastLocalMigrationName, loadMigrationFilesCached, localMigrationFiles } from './files'
 import { ProgressiveMigrations } from './progressive'
 import { DisableConcurrentIndexTransformer, MigrationTransformer } from './transformers'
@@ -32,8 +34,13 @@ const {
   dbRefreshMigrationHashesOnMismatch,
   dbMigrationFreezeAt,
   icebergShards,
-  multitenantDatabaseQueryTimeout,
+  vectorBucketProvider,
+  vectorDatabaseCreate,
+  vectorStoreMigrationsEnabled,
+  vectorDatabaseURL,
 } = getConfig()
+
+const tenantConfigStorePg = new TenantConfigStorePg(multitenantPgExecutor)
 
 /**
  * Migrations that were added after the initial release
@@ -67,7 +74,7 @@ export function startAsyncMigrations(signal: AbortSignal) {
       progressiveMigrations.start(signal)
       break
     case MultitenantMigrationStrategy.FULL_FLEET:
-      runMigrationsOnAllTenants(signal).catch((e) => {
+      runMigrationsOnAllTenants({ signal }).catch((e) => {
         logger.error(
           {
             type: 'migrations',
@@ -102,24 +109,13 @@ export async function* listTenantsToMigrate(signal: AbortSignal) {
   while (!signal.aborted) {
     const migrationVersion = await lastLocalMigrationName()
 
-    const data = await multitenantKnex
-      .table<{ id: string; cursor_id: number }>('tenants')
-      .select('id', 'cursor_id')
-      .where('cursor_id', '>', lastCursor)
-      .where((builder) => {
-        builder
-          .where((whereBuilder) => {
-            whereBuilder
-              .where('migrations_version', '!=', migrationVersion)
-              .whereNotIn('migrations_status', [
-                TenantMigrationStatus.FAILED,
-                TenantMigrationStatus.FAILED_STALE,
-              ])
-          })
-          .orWhere('migrations_status', null)
-      })
-      .orderBy('cursor_id', 'asc')
-      .limit(200)
+    const data = await tenantConfigStorePg.listTenantsToMigrateBatch(
+      migrationVersion,
+      lastCursor,
+      [TenantMigrationStatus.FAILED, TenantMigrationStatus.FAILED_STALE],
+      200,
+      signal
+    )
 
     if (data.length === 0) {
       break
@@ -141,13 +137,12 @@ export async function* listTenantsToResetMigrations(
       return DBMigration[migrationName as keyof typeof DBMigration] > DBMigration[migration]
     })
 
-    const data = await multitenantKnex
-      .table<{ id: string; cursor_id: number }>('tenants')
-      .select('id', 'cursor_id')
-      .where('cursor_id', '>', lastCursor)
-      .whereIn('migrations_version', afterMigrations)
-      .orderBy('cursor_id', 'asc')
-      .limit(200)
+    const data = await tenantConfigStorePg.listTenantsToResetMigrationsBatch(
+      afterMigrations,
+      lastCursor,
+      200,
+      signal
+    )
 
     if (data.length === 0) {
       break
@@ -168,26 +163,21 @@ export async function updateTenantMigrationsState(
   options?: {
     migration?: keyof typeof DBMigration
     state: TenantMigrationStatus
-    tnx?: Knex.Transaction
+    tnx?: PgExecutor
   }
 ) {
   const migrationVersion = options?.migration || (await lastLocalMigrationName())
   const state = options?.state || TenantMigrationStatus.COMPLETED
-  const db = options?.tnx ? options.tnx : multitenantKnex
+  const migrationState = {
+    migrations_version: [TenantMigrationStatus.FAILED, TenantMigrationStatus.FAILED_STALE].includes(
+      state
+    )
+      ? undefined
+      : migrationVersion,
+    migrations_status: state,
+  }
 
-  return db
-    .table('tenants')
-    .where('id', tenantId)
-    .update({
-      migrations_version: [
-        TenantMigrationStatus.FAILED,
-        TenantMigrationStatus.FAILED_STALE,
-      ].includes(state)
-        ? undefined
-        : migrationVersion,
-      migrations_status: state,
-    })
-    .abortOnSignal(AbortSignal.timeout(multitenantDatabaseQueryTimeout))
+  return tenantConfigStorePg.update(tenantId, migrationState, options?.tnx ?? multitenantPgExecutor)
 }
 
 /**
@@ -205,29 +195,53 @@ export async function areMigrationsUpToDate(tenantId: string) {
   )
 }
 
-export async function obtainLockOnMultitenantDB<T>(fn: (tnx: Knex.Transaction) => Promise<T>) {
-  const trx = await multitenantKnex.transaction()
+export async function obtainLockOnMultitenantDB<T>(
+  fn: (tnx: PgTransaction) => Promise<T>,
+  options?: { sbReqId?: string }
+) {
+  const trx = await multitenantPgExecutor.beginTransaction()
   try {
-    const result = await trx.raw(
-      `SELECT pg_try_advisory_xact_lock(?) AS locked;`,
-      [-8575985245963000605]
-    )
+    const result = await trx.query<{ locked: boolean }>({
+      text: `SELECT pg_try_advisory_xact_lock($1) AS locked;`,
+      values: [-8575985245963000605],
+    })
     const lockAcquired = result.rows.shift()?.locked || false
 
     if (!lockAcquired) {
-      await trx.rollback()
+      try {
+        await trx.rollback()
+      } catch (rollbackError) {
+        logSchema.warning(logger, '[Migrations] Failed to rollback transaction', {
+          type: 'migrations',
+          sbReqId: options?.sbReqId,
+          error: rollbackError,
+          metadata: JSON.stringify({
+            reason: 'lock not acquired',
+          }),
+        })
+      }
       return
     }
 
     logSchema.info(logger, '[Migrations] Instance acquired the lock', {
       type: 'migrations',
+      sbReqId: options?.sbReqId,
     })
 
     const fnResult = await fn(trx)
     await trx.commit()
     return fnResult
   } catch (e) {
-    await trx.rollback()
+    try {
+      await trx.rollback()
+    } catch (rollbackError) {
+      logSchema.warning(logger, '[Migrations] Failed to rollback transaction', {
+        type: 'migrations',
+        sbReqId: options?.sbReqId,
+        error: rollbackError,
+        metadata: JSON.stringify({ originalError: String(e) }),
+      })
+    }
     throw e
   }
 }
@@ -236,67 +250,83 @@ export async function resetMigrationsOnTenants(options: {
   till: keyof typeof DBMigration
   markCompletedTillMigration?: keyof typeof DBMigration
   signal: AbortSignal
+  sbReqId?: string
 }) {
-  await obtainLockOnMultitenantDB(async () => {
-    logSchema.info(logger, '[Migrations] Listing all tenants', {
-      type: 'migrations',
-    })
+  await obtainLockOnMultitenantDB(
+    async () => {
+      logSchema.info(logger, '[Migrations] Listing all tenants', {
+        type: 'migrations',
+        sbReqId: options.sbReqId,
+      })
 
-    const tenants = listTenantsToResetMigrations(options.till, options.signal)
+      const tenants = listTenantsToResetMigrations(options.till, options.signal)
 
-    for await (const tenantBatch of tenants) {
-      await ResetMigrationsOnTenant.batchSend(
-        tenantBatch.map((tenant) => {
-          return new ResetMigrationsOnTenant({
-            tenantId: tenant,
-            untilMigration: options.till,
-            markCompletedTillMigration: options.markCompletedTillMigration,
-            tenant: {
-              host: '',
-              ref: tenant,
-            },
+      for await (const tenantBatch of tenants) {
+        await ResetMigrationsOnTenant.batchSend(
+          tenantBatch.map((tenant) => {
+            return new ResetMigrationsOnTenant({
+              tenantId: tenant,
+              untilMigration: options.till,
+              markCompletedTillMigration: options.markCompletedTillMigration,
+              sbReqId: options.sbReqId,
+              tenant: {
+                host: '',
+                ref: tenant,
+              },
+            })
           })
-        })
-      )
-    }
+        )
+      }
 
-    logSchema.info(logger, '[Migrations] reset migrations jobs scheduled', {
-      type: 'migrations',
-    })
-  })
+      logSchema.info(logger, '[Migrations] reset migrations jobs scheduled', {
+        type: 'migrations',
+        sbReqId: options.sbReqId,
+      })
+    },
+    { sbReqId: options.sbReqId }
+  )
 }
 
 /**
  * Runs migrations for all tenants
  * only one instance at the time is allowed to run
  */
-export async function runMigrationsOnAllTenants(signal: AbortSignal) {
+export async function runMigrationsOnAllTenants(options: {
+  signal: AbortSignal
+  sbReqId?: string
+}) {
   if (!pgQueueEnable) {
     return
   }
-  await obtainLockOnMultitenantDB(async () => {
-    logSchema.info(logger, '[Migrations] Listing all tenants', {
-      type: 'migrations',
-    })
-    const tenants = listTenantsToMigrate(signal)
-    for await (const tenantBatch of tenants) {
-      await RunMigrationsOnTenants.batchSend(
-        tenantBatch.map((tenant) => {
-          return new RunMigrationsOnTenants({
-            tenantId: tenant,
-            tenant: {
-              host: '',
-              ref: tenant,
-            },
+  await obtainLockOnMultitenantDB(
+    async () => {
+      logSchema.info(logger, '[Migrations] Listing all tenants', {
+        type: 'migrations',
+        sbReqId: options.sbReqId,
+      })
+      const tenants = listTenantsToMigrate(options.signal)
+      for await (const tenantBatch of tenants) {
+        await RunMigrationsOnTenants.batchSend(
+          tenantBatch.map((tenant) => {
+            return new RunMigrationsOnTenants({
+              tenantId: tenant,
+              sbReqId: options.sbReqId,
+              tenant: {
+                host: '',
+                ref: tenant,
+              },
+            })
           })
-        })
-      )
-    }
+        )
+      }
 
-    logSchema.info(logger, '[Migrations] Async migrations jobs completed', {
-      type: 'migrations',
-    })
-  })
+      logSchema.info(logger, '[Migrations] Async migrations jobs completed', {
+        type: 'migrations',
+        sbReqId: options.sbReqId,
+      })
+    },
+    { sbReqId: options.sbReqId }
+  )
 }
 
 /**
@@ -353,6 +383,155 @@ export async function runMigrationsOnTenant({
     waitForLock,
     upToMigration,
   })
+
+  // pgvector mode: run the vector_store migrations after the standard tenant
+  // migrations. Branching:
+  //   • Multi-tenant: vectors live in each tenant's DB (per-tenant schema
+  //     isolation via TenantConnection), so we migrate into the same URL.
+  //   • Single-tenant: vectors live in a dedicated `storage_vectors` database
+  //     on the server pointed at by VECTOR_DATABASE_URL. The migration runner
+  //     CREATE DATABASE's it and then connects via the derived URL. Set
+  //     VECTOR_DATABASE_CREATE=false to run vector migrations in the configured
+  //     database instead, for gateways that do not support CREATE DATABASE.
+  if (vectorBucketProvider === 'pgvector' && vectorStoreMigrationsEnabled) {
+    if (isMultitenant) {
+      await runVectorStoreMigrations({ databaseUrl, waitForLock })
+    } else if (vectorDatabaseURL) {
+      await runVectorStoreMigrations({
+        databaseUrl: vectorDatabaseURL,
+        createDatabase: vectorDatabaseCreate,
+        waitForLock,
+      })
+    }
+  }
+}
+
+// Re-exported from a leaf module so request-path code (http/plugins/vector.ts)
+// can import these without pulling in the migration runner.
+export { deriveVectorDatabaseUrl, VECTOR_DATABASE_NAME } from '../vector-store-url'
+
+/**
+ * Creates the `storage_vectors` Postgres database on the same server as
+ * `maintenanceUrl` if it does not already exist. Connects to the URL as-is —
+ * the caller is expected to point it at an existing DB on the target server
+ * (e.g. `postgres`, the default maintenance DB).
+ */
+async function ensureVectorDatabaseExists(
+  maintenanceUrl: string,
+  ssl: ClientConfig['ssl']
+): Promise<void> {
+  let defaultAccessMethod = ''
+  const client = await connect({
+    connectionString: maintenanceUrl,
+    ssl,
+  })
+  try {
+    defaultAccessMethod = await getDefaultAccessMethod(client)
+    const exists = await client.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [
+      VECTOR_DATABASE_NAME,
+    ])
+    if (exists.rows.length === 0) {
+      // CREATE DATABASE doesn't accept parameter binding; the name is a
+      // hard-coded constant we control, so direct interpolation is safe.
+      await client.query(`CREATE DATABASE "${VECTOR_DATABASE_NAME}"`)
+      logSchema.info(logger, `[Migrations] Created database ${VECTOR_DATABASE_NAME}`, {
+        type: 'migrations',
+      })
+    }
+  } finally {
+    await client.end()
+  }
+
+  await configureVectorDatabaseAccessMethod({
+    databaseUrl: deriveVectorDatabaseUrl(maintenanceUrl),
+    defaultAccessMethod,
+    ssl,
+  })
+}
+
+async function configureVectorDatabaseAccessMethod({
+  databaseUrl,
+  defaultAccessMethod,
+  ssl,
+}: {
+  databaseUrl: string
+  defaultAccessMethod: string
+  ssl: ClientConfig['ssl']
+}): Promise<void> {
+  if (defaultAccessMethod !== 'orioledb') {
+    return
+  }
+
+  const client = await connect({
+    connectionString: databaseUrl,
+    ssl,
+  })
+  try {
+    await client.query('CREATE EXTENSION IF NOT EXISTS orioledb')
+    await client.query(
+      `ALTER DATABASE "${VECTOR_DATABASE_NAME}" SET default_table_access_method = 'orioledb'`
+    )
+    logSchema.info(logger, `[Migrations] Configured database ${VECTOR_DATABASE_NAME} for Oriole`, {
+      type: 'migrations',
+    })
+  } finally {
+    await client.end()
+  }
+}
+
+/**
+ * Runs vector-store migrations against a Postgres database. The migrations live
+ * in ./migrations/vector_store and are tracked in storage_vectors.migrations,
+ * isolated from the standard tenant migrations (storage.migrations) by schema.
+ *
+ * Only invoked when VECTOR_BUCKET_PROVIDER=pgvector and
+ * VECTOR_STORE_MIGRATIONS_ENABLED=true (gated by the caller).
+ *
+ * @param databaseUrl     when `createDatabase=true` (single-tenant), this is the
+ *                        maintenance URL on the target Postgres server; the
+ *                        runner will CREATE DATABASE `storage_vectors` against
+ *                        it and run migrations on the derived URL. When
+ *                        `createDatabase=false` (multi-tenant), this is the
+ *                        tenant's own DB URL and migrations run there directly.
+ * @param createDatabase  bootstrap the dedicated `storage_vectors` database
+ *                        before migrating into it (single-tenant only).
+ */
+export async function runVectorStoreMigrations({
+  databaseUrl,
+  createDatabase = false,
+  waitForLock = true,
+}: {
+  databaseUrl: string
+  createDatabase?: boolean
+  waitForLock?: boolean
+}): Promise<void> {
+  logSchema.info(logger, '[Migrations] Running vector_store migrations', {
+    type: 'migrations',
+  })
+  const ssl = getSslSettings({ connectionString: databaseUrl, databaseSSLRootCert })
+
+  let migrationsTarget = databaseUrl
+  if (createDatabase) {
+    await ensureVectorDatabaseExists(databaseUrl, ssl)
+    migrationsTarget = deriveVectorDatabaseUrl(databaseUrl)
+  }
+
+  await connectAndMigrate({
+    databaseUrl: migrationsTarget,
+    migrationsDirectory: './migrations/vector_store',
+    // Schema-scoped tracking: storage_vectors.migrations lives in its own
+    // schema, so it can't collide with the storage.migrations table used by
+    // the standard tenant migrations even though both share the default
+    // table name. postgres-migrations bundles a `0_create-migrations-table`
+    // bootstrap that hardcodes the literal name `migrations`, so we cannot
+    // rename it without forking the library.
+    migrationsTableSchema: 'storage_vectors',
+    ssl,
+    // Bootstrap the storage_vectors schema before postgres-migrations tries to
+    // create its tracking table inside it.
+    shouldCreateStorageSchema: true,
+    waitForLock,
+  })
 }
 
 export async function resetMigration(options: {
@@ -373,31 +552,31 @@ export async function resetMigration(options: {
 
   try {
     const queryWithAdvisory = withAdvisoryLock(false, async (pgClient) => {
+      await pgClient.query(`SET search_path TO ${searchPath.join(',')}`)
+
+      const migrationsRowsResult = await pgClient.query(`SELECT * from migrations`)
+      const currentTenantMigrations = migrationsRowsResult.rows as { id: number; name: string }[]
+
+      if (!currentTenantMigrations.length) {
+        return false
+      }
+
+      const currentLastMigration = currentTenantMigrations[currentTenantMigrations.length - 1]
+      const localMigration = DBMigration[options.untilMigration]
+
+      // This tenant migration is already at the desired migration
+      if (currentLastMigration.id === localMigration) {
+        return false
+      }
+
+      // This tenant migration is behind of the desired migration
+      if (currentLastMigration.id < localMigration) {
+        return false
+      }
+
       await pgClient.query(`BEGIN`)
 
       try {
-        await client.query(`SET search_path TO ${searchPath.join(',')}`)
-
-        const migrationsRowsResult = await pgClient.query(`SELECT * from migrations`)
-        const currentTenantMigrations = migrationsRowsResult.rows as { id: number; name: string }[]
-
-        if (!currentTenantMigrations.length) {
-          return false
-        }
-
-        const currentLastMigration = currentTenantMigrations[currentTenantMigrations.length - 1]
-        const localMigration = DBMigration[options.untilMigration]
-
-        // This tenant migration is already at the desired migration
-        if (currentLastMigration.id === localMigration) {
-          return false
-        }
-
-        // This tenant migration is behind of the desired migration
-        if (currentLastMigration.id < localMigration) {
-          return false
-        }
-
         // This tenant migration is ahead the desired migration
         await pgClient.query(SQL`DELETE FROM migrations WHERE id > ${localMigration}`)
 
@@ -613,7 +792,15 @@ function runMigrations({
     try {
       const migrationTableName = 'migrations'
 
-      await client.query(`SET search_path TO ${searchPath.join(',')}`)
+      // If migrations are tracked in a non-default schema (e.g. storage_vectors),
+      // prepend it to search_path so the postgres-migrations library's bundled
+      // bootstrap (which references `migrations` unqualified) resolves to the
+      // right table — otherwise we'd collide with storage.migrations.
+      const effectiveSearchPath =
+        migrationsTableSchema && !searchPath.includes(migrationsTableSchema)
+          ? [migrationsTableSchema, ...searchPath]
+          : searchPath
+      await client.query(`SET search_path TO ${effectiveSearchPath.join(',')}`)
 
       let appliedMigrations: Migration[] = []
       if (
@@ -639,9 +826,10 @@ function runMigrations({
           )
         }
       } else if (shouldCreateStorageSchema) {
-        const schemaExists = await doesSchemaExists(client, 'storage')
+        const targetSchema = migrationsTableSchema ?? 'storage'
+        const schemaExists = await doesSchemaExists(client, targetSchema)
         if (!schemaExists) {
-          await client.query(`CREATE SCHEMA IF NOT EXISTS storage`)
+          await client.query(`CREATE SCHEMA IF NOT EXISTS ${targetSchema}`)
         }
       }
 
@@ -667,30 +855,36 @@ function runMigrations({
       const icebergDefaultShard = icebergShards.length > 0 ? icebergShards[0] : ''
 
       if (migrationsToRun.length > 0) {
-        await client.query(SQL`SELECT
-          set_config('storage.install_roles', ${dbInstallRoles}, false),
-          set_config('storage.multitenant', ${isMultitenant ? 'true' : 'false'}, false),
-          set_config('storage.anon_role', ${dbAnonRole}, false),
-          set_config('storage.authenticated_role', ${dbAuthenticatedRole}, false),
-          set_config('storage.service_role', ${dbServiceRole}, false),
-          set_config('storage.super_user', ${dbSuperUser}, false),
-          set_config('storage.iceberg_default_shard', ${icebergDefaultShard}, false),
-          set_config('storage.iceberg_shards', ${icebergShardVar}, false);
+        // set_config requires literal values, not bound parameters.
+        const lit = (v: string | boolean) => `'${String(v).replace(/'/g, "''")}'`
+        await client.query(`SELECT
+          set_config('storage.install_roles', ${lit(dbInstallRoles)}, false),
+          set_config('storage.multitenant', ${lit(isMultitenant ? 'true' : 'false')}, false),
+          set_config('storage.anon_role', ${lit(dbAnonRole)}, false),
+          set_config('storage.authenticated_role', ${lit(dbAuthenticatedRole)}, false),
+          set_config('storage.service_role', ${lit(dbServiceRole)}, false),
+          set_config('storage.super_user', ${lit(dbSuperUser)}, false),
+          set_config('storage.iceberg_default_shard', ${lit(icebergDefaultShard)}, false),
+          set_config('storage.iceberg_shards', ${lit(icebergShardVar)}, false),
+          set_config('storage.vector_bucket_provider', ${lit(vectorBucketProvider)}, false);
         `)
       }
 
       for (const migration of migrationsToRun) {
         try {
           const ignore = migration.sql.includes('-- postgres-migrations ignore')
+          const runnableMigration = ignore
+            ? {
+                ...migration,
+                sql: 'SELECT 1;',
+                contents: 'SELECT 1;',
+              }
+            : migration
 
-          if (ignore) {
-            ;(migration as any).sql = 'SELECT 1;'
-            ;(migration as any).contents = 'SELECT 1;'
-          }
           const result = await runMigration(
             migrationTableName,
             client
-          )(runMigrationTransformers(migration, transformers))
+          )(runMigrationTransformers(runnableMigration, transformers))
           completedMigrations.push(result)
         } catch (e) {
           throw ERRORS.DatabaseError(
@@ -820,41 +1014,33 @@ function withAdvisoryLock<T>(
 ): (client: BasicPgClient) => Promise<T> {
   return async (client: BasicPgClient): Promise<T> => {
     try {
-      try {
-        let acquired = false
-        let tries = 1
+      let acquired = false
+      let tries = 1
 
-        const timeout = 3000
-        const start = Date.now()
+      const timeout = 3000
+      const start = Date.now()
 
-        while (!acquired) {
-          const elapsed = Date.now() - start
-          if (elapsed > timeout) {
+      while (!acquired) {
+        const elapsed = Date.now() - start
+        if (elapsed > timeout) {
+          throw ERRORS.LockTimeout()
+        }
+
+        const lockResult = await client.query('SELECT pg_try_advisory_lock(-8525285245963000605);')
+        if (lockResult.rows[0].pg_try_advisory_lock === true) {
+          acquired = true
+        } else {
+          if (waitForLock) {
+            await new Promise((res) => setTimeout(res, 20 * tries))
+          } else {
             throw ERRORS.LockTimeout()
           }
-
-          const lockResult = await client.query(
-            'SELECT pg_try_advisory_lock(-8525285245963000605);'
-          )
-          if (lockResult.rows[0].pg_try_advisory_lock === true) {
-            acquired = true
-          } else {
-            if (waitForLock) {
-              await new Promise((res) => setTimeout(res, 20 * tries))
-            } else {
-              throw ERRORS.LockTimeout()
-            }
-          }
-
-          tries++
         }
-      } catch (e) {
-        throw e
+
+        tries++
       }
 
       return await f(client)
-    } catch (e) {
-      throw e
     } finally {
       try {
         await client.query('SELECT pg_advisory_unlock(-8525285245963000605);')

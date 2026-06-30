@@ -16,9 +16,11 @@ import {
   PeriodicExportingMetricReader,
 } from '@opentelemetry/sdk-metrics'
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions'
+import { getGlobal } from '@platformatic/globals'
 import { FastifyReply, FastifyRequest } from 'fastify'
 import * as os from 'os'
 import { getConfig } from '../../config'
+import { HTTP_SIZE_METRICS_AGGREGATION_CARDINALITY_LIMIT } from './metric-limits'
 
 const {
   version,
@@ -27,6 +29,7 @@ const {
   otelMetricsTemporality,
   prometheusMetricsEnabled,
   region,
+  serviceName,
 } = getConfig()
 
 let prometheusExporter: PrometheusExporter | undefined
@@ -36,6 +39,39 @@ let unregisterMetricInstrumentations: (() => void) | undefined
 
 interface OTelMetricsGlobalState {
   __otelMetricsShutdown?: () => Promise<void>
+}
+
+const SERVICE_INSTANCE_ID_ATTRIBUTE = 'service.instance.id'
+const PROCESS_PID_ATTRIBUTE = 'process.pid'
+const WORKER_ID_ATTRIBUTE = 'worker.id'
+const PLATFORMATIC_APPLICATION_ID_ATTRIBUTE = 'platformatic.application.id'
+
+function normalizeMetricIdentityPart(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return `${value}`
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed === '' ? undefined : trimmed
+  }
+
+  return undefined
+}
+
+function resolveMetricIdentity() {
+  const hostname = os.hostname()
+  const platformatic = getGlobal()
+  const applicationId = normalizeMetricIdentityPart(platformatic?.applicationId)
+  const workerId = normalizeMetricIdentityPart(platformatic?.workerId)
+  const runtimeId = workerId === undefined ? `pid:${process.pid}` : `worker:${workerId}`
+
+  return {
+    instance: hostname,
+    serviceInstanceId: [hostname, applicationId, runtimeId].filter(Boolean).join(':'),
+    applicationId,
+    workerId,
+  }
 }
 
 function unregisterMetricInstrumentation(unregister: (() => void) | undefined) {
@@ -56,7 +92,8 @@ function unregisterMetricInstrumentation(unregister: (() => void) | undefined) {
 // =============================================================================
 // Shared config
 // =============================================================================
-const instance = os.hostname()
+const metricIdentity = resolveMetricIdentity()
+const instance = metricIdentity.instance
 const headersEnv = process.env.OTEL_EXPORTER_OTLP_METRICS_HEADERS || ''
 const otlpEndpoint =
   process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || process.env.OTEL_EXPORTER_OTLP_ENDPOINT
@@ -79,11 +116,17 @@ Object.keys(exporterHeaders).forEach((key) => {
 })
 
 const resource = resourceFromAttributes({
-  [ATTR_SERVICE_NAME]: 'storage_api',
+  [ATTR_SERVICE_NAME]: serviceName,
   [ATTR_SERVICE_VERSION]: version,
   'metric.version': '1',
   region,
   instance,
+  [SERVICE_INSTANCE_ID_ATTRIBUTE]: metricIdentity.serviceInstanceId,
+  [PROCESS_PID_ATTRIBUTE]: process.pid,
+  ...(metricIdentity.workerId ? { [WORKER_ID_ATTRIBUTE]: metricIdentity.workerId } : {}),
+  ...(metricIdentity.applicationId
+    ? { [PLATFORMATIC_APPLICATION_ID_ATTRIBUTE]: metricIdentity.applicationId }
+    : {}),
 })
 
 // Bucket boundaries for duration histograms (in seconds)
@@ -96,15 +139,35 @@ const histogramAggregation = {
   options: { boundaries: durationBuckets },
 } as const
 
+// GC pauses span sub-millisecond incremental slices to multi-second major
+// collections, so the default 4-boundary [10ms, 100ms, 1s, 10s] histogram is
+// too coarse to distinguish incremental/minor GC and lacks resolution above 1s.
+const gcDurationBuckets = [0.0001, 0.00025, ...durationBuckets, 30]
+
+const gcHistogramAggregation = {
+  type: AggregationType.EXPLICIT_BUCKET_HISTOGRAM,
+  options: { boundaries: gcDurationBuckets },
+} as const
+
 const dropAggregation = { type: AggregationType.DROP } as const
 
 // Views — custom histogram buckets + drop auto-instrumentation duplicates.
-// Tenant attribute stripping is handled by registerMetric() in metrics.ts.
 const views = [
   {
     meterName: 'storage-api',
     instrumentName: 'http_request_duration_seconds',
     aggregation: histogramAggregation,
+    aggregationCardinalityLimit: HTTP_SIZE_METRICS_AGGREGATION_CARDINALITY_LIMIT,
+  },
+  {
+    meterName: 'storage-api',
+    instrumentName: 'http_request_size_bytes',
+    aggregationCardinalityLimit: HTTP_SIZE_METRICS_AGGREGATION_CARDINALITY_LIMIT,
+  },
+  {
+    meterName: 'storage-api',
+    instrumentName: 'http_response_size_bytes',
+    aggregationCardinalityLimit: HTTP_SIZE_METRICS_AGGREGATION_CARDINALITY_LIMIT,
   },
   {
     meterName: 'storage-api',
@@ -125,6 +188,13 @@ const views = [
     meterName: 'storage-api',
     instrumentName: 's3_upload_part_seconds',
     aggregation: histogramAggregation,
+  },
+  // Override the RuntimeNodeInstrumentation default GC buckets ([10ms, 100ms,
+  // 1s, 10s]) with sub-ms boundaries so incremental/minor pauses are visible.
+  {
+    meterName: '@opentelemetry/instrumentation-runtime-node',
+    instrumentName: 'v8js.gc.duration',
+    aggregation: gcHistogramAggregation,
   },
   // Drop duplicate HTTP metrics from auto-instrumentations — we have our own in metrics.ts
   {
@@ -237,9 +307,10 @@ if (otelMetricsEnabled) {
 
   if (prometheusMetricsEnabled) {
     prometheusExporter = new PrometheusExporter({
-      prefix: 'storage_api',
+      prefix: serviceName,
       preventServerStart: true,
-      withResourceConstantLabels: /^(region|instance|metric\.version)$/,
+      withResourceConstantLabels:
+        /^(region|instance|metric\.version|service\.name|service\.instance\.id|worker\.id|platformatic\.application\.id)$/,
     })
     readers.push(prometheusExporter)
   }

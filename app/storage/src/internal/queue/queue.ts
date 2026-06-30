@@ -3,20 +3,26 @@ import { QueueDB } from '@internal/queue/database'
 import { Semaphore } from '@shopify/semaphore'
 import PgBoss, { Db, Job, JobWithMetadata } from 'pg-boss'
 import { getConfig } from '../../config'
-import { logger, logSchema } from '../monitoring'
+import { getSbReqIdFromPayload, logger, logSchema } from '../monitoring'
 import { queueJobCompleted, queueJobError, queueJobRetryFailed } from '../monitoring/metrics'
 import { Event } from './event'
 
-type SubclassOfBaseClass = (new (
-  payload: any
-) => Event<any>) & {
-  [K in keyof typeof Event]: (typeof Event)[K]
+type RegisteredEvent = {
+  deadLetterQueueName(): string
+  getQueueName(): string
+  getQueueOptions(): ReturnType<typeof Event.getQueueOptions>
+  getWorkerOptions(): ReturnType<typeof Event.getWorkerOptions>
+  handle(job: Job<unknown> | Job<unknown>[], opts?: { signal?: AbortSignal }): unknown
+  onClose(): unknown
+  onStart(): unknown
+  name: string
 }
 
 export const PG_BOSS_SCHEMA = 'pgboss_v10'
+const queueStopTimeoutMs = 25_000
 
 export abstract class Queue {
-  protected static events: SubclassOfBaseClass[] = []
+  protected static events: RegisteredEvent[] = []
   private static pgBoss?: PgBoss
   private static pgBossDb?: PgBoss.Db
 
@@ -91,6 +97,7 @@ export abstract class Queue {
       pgQueueReadWriteTimeout,
       pgQueueConcurrentTasksPerQueue,
       pgQueueMaxConnections,
+      databaseApplicationName,
     } = getConfig()
 
     let url = pgQueueConnectionURL || databaseURL
@@ -108,6 +115,7 @@ export abstract class Queue {
       min: 0,
       max: pgQueueMaxConnections,
       connectionString: url,
+      application_name: databaseApplicationName,
       statement_timeout: pgQueueReadWriteTimeout > 0 ? pgQueueReadWriteTimeout : undefined,
     })
 
@@ -155,11 +163,6 @@ export abstract class Queue {
                 type: 'queue',
               })
             })
-            .finally(async () => {
-              await Queue.callClose().catch(() => {
-                // no-op
-              })
-            })
         },
         { once: true }
       )
@@ -184,7 +187,7 @@ export abstract class Queue {
     return this.pgBossDb
   }
 
-  static register<T extends SubclassOfBaseClass>(event: T) {
+  static register<T extends RegisteredEvent>(event: T) {
     Queue.events.push(event)
   }
 
@@ -194,17 +197,31 @@ export abstract class Queue {
     }
 
     const boss = this.pgBoss
+    const db = this.pgBossDb
     const { isProduction } = getConfig()
 
-    await boss.stop({
-      timeout: 20 * 1000,
-      graceful: isProduction,
-      wait: true,
-    })
+    try {
+      await withQueueStopTimeout(
+        boss.stop({
+          timeout: 20 * 1000,
+          graceful: isProduction,
+          wait: true,
+        }),
+        'Queue stop'
+      )
+    } finally {
+      try {
+        await withQueueStopTimeout(this.callClose(), 'Queue close')
+      } finally {
+        if (Queue.pgBoss === boss) {
+          Queue.pgBoss = undefined
+        }
 
-    await this.callClose()
-
-    Queue.pgBoss = undefined
+        if (Queue.pgBossDb === db) {
+          Queue.pgBossDb = undefined
+        }
+      }
+    }
   }
 
   protected static async startWorkers(opts: {
@@ -234,7 +251,7 @@ export abstract class Queue {
   }
 
   protected static async registerTask(
-    event: SubclassOfBaseClass,
+    event: RegisteredEvent,
     maxConcurrentTasks: number,
     onMessage?: (job: Job) => void,
     signal?: AbortSignal
@@ -276,7 +293,7 @@ export abstract class Queue {
   }
 
   protected static pollQueue(
-    event: SubclassOfBaseClass,
+    event: RegisteredEvent,
     queueOpts: {
       concurrentTaskCount: number
       onMessage?: (job: Job) => void
@@ -344,6 +361,8 @@ export abstract class Queue {
         await Promise.allSettled(
           jobs.map(async (job) => {
             const lock = await semaphore.acquire()
+            const sbReqId = getSbReqIdFromPayload(job.data)
+
             try {
               queueOpts.onMessage?.(job as Job)
 
@@ -379,6 +398,7 @@ export abstract class Queue {
                   type: 'queue-task',
                   error: e,
                   metadata: JSON.stringify(job),
+                  sbReqId,
                 })
               }
 
@@ -386,6 +406,7 @@ export abstract class Queue {
                 type: 'queue-task',
                 error: e,
                 metadata: JSON.stringify(job),
+                sbReqId,
               })
 
               throw e
@@ -413,5 +434,24 @@ export abstract class Queue {
     queueOpts.signal?.addEventListener('abort', () => {
       clearInterval(interval)
     })
+  }
+}
+
+async function withQueueStopTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${queueStopTimeoutMs}ms`))
+    }, queueStopTimeoutMs)
+    timeout.unref?.()
+  })
+
+  try {
+    return await Promise.race([promise, timeoutPromise])
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout)
+    }
   }
 }

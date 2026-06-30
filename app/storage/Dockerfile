@@ -5,11 +5,11 @@ FROM node:24-alpine3.23 AS base
 RUN apk add --no-cache g++ make python3 wget
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY scripts/ensure-npm-version.cjs ./scripts/ensure-npm-version.cjs
+RUN node scripts/ensure-npm-version.cjs
 
 # Dependencies stage - install and cache all dependencies
 FROM base AS dependencies
-# Copy patches before npm ci so postinstall can apply them
-COPY patches ./patches
 RUN npm ci
 # Cache the installed node_modules for later stages
 RUN cp -R node_modules /node_modules_cache
@@ -23,7 +23,7 @@ RUN npm run build
 # Production dependencies stage - prune dev dependencies from cached node_modules
 FROM base AS production-deps
 COPY --from=dependencies /node_modules_cache ./node_modules
-# Use npm prune to remove dev dependencies while keeping compiled native modules and patches
+# Use npm prune to remove dev dependencies while keeping compiled native modules
 RUN npm prune --omit=dev
 
 # Final stage - for the production build

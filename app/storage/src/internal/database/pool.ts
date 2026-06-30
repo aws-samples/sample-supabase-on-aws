@@ -1,6 +1,4 @@
-import { createTtlCache } from '@internal/cache'
-import { wait } from '@internal/concurrency'
-import { getSslSettings } from '@internal/database/ssl'
+import { type CacheLookupOutcome, createTtlCache, TENANT_POOL_CACHE_NAME } from '@internal/cache'
 import { logger, logSchema } from '@internal/monitoring'
 import {
   dbActiveConnection,
@@ -8,35 +6,34 @@ import {
   dbInUseConnection,
   isMetricEnabled,
   meter,
+  recordCacheEviction,
+  recordCacheRequest,
 } from '@internal/monitoring/metrics'
 import { JWTPayload } from 'jose'
-import { Knex, knex } from 'knex'
 import { getConfig } from '../../config'
 
 const {
   isMultitenant,
-  databaseSSLRootCert,
-  databaseMaxConnections,
-  databaseFreePoolAfterInactivity,
-  databaseConnectionTimeout,
   dbSearchPath,
-  dbPostgresVersion,
-  databaseApplicationName,
+  tenantPoolCacheTtlMs,
+  tenantPoolCacheHitLogSampleRate,
+  tenantPoolCacheMissLogSampleRate,
 } = getConfig()
 
-export interface TenantConnectionOptions {
-  user: User
-  superUser: User
+export const TENANT_POOL_CACHE_LOOKUP_LOG_TYPE = 'cache'
+export const TENANT_POOL_CACHE_LOOKUP_LOG_MESSAGE = '[Cache] Tenant pool lookup'
 
+export interface TenantConnectionOptions {
   tenantId: string
   dbUrl: string
   isExternalPool?: boolean
-  isSingleUse?: boolean
   idleTimeoutMillis?: number
   reapIntervalMillis?: number
   maxConnections: number
   clusterSize?: number
   numWorkers?: number
+  user: User
+  superUser: User
   headers?: Record<string, string | undefined | string[]>
   method?: string
   path?: string
@@ -53,9 +50,13 @@ export interface PoolStats {
   total: number
 }
 
+export interface PoolRebalanceOptions {
+  clusterSize?: number
+  maxConnections?: number
+}
+
 export interface PoolStrategy {
-  acquire(): Knex
-  rebalance(options: { clusterSize: number }): void
+  rebalance(options: PoolRebalanceOptions): void
   destroy(): Promise<void>
   getPoolStats(): PoolStats | null
 }
@@ -65,7 +66,7 @@ export const searchPath = ['storage', 'public', 'extensions', ...dbSearchPath.sp
 )
 
 const multiTenantTtlConfig = {
-  ttl: 1000 * 10,
+  ttl: tenantPoolCacheTtlMs,
   updateAgeOnGet: true,
   checkAgeOnGet: true,
 }
@@ -91,12 +92,62 @@ async function destroyPoolSafely(pool: PoolStrategy): Promise<void> {
   }
 }
 
+function recordTenantPoolCacheEviction(reason: string): void {
+  // Explicit destroy paths are filtered before this helper is called.
+  if (reason === 'stale' || reason === 'evict' || reason === 'delete') {
+    recordCacheEviction(TENANT_POOL_CACHE_NAME)
+  }
+}
+
+function recordTenantPoolCacheRequest(outcome: CacheLookupOutcome): void {
+  recordCacheRequest(TENANT_POOL_CACHE_NAME, outcome)
+}
+
+function recordTenantPoolCacheLookup(
+  settings: TenantConnectionOptions,
+  outcome: CacheLookupOutcome
+): void {
+  recordTenantPoolCacheRequest(outcome)
+  logTenantPoolCacheLookup(settings, outcome)
+}
+
+function shouldLogTenantPoolCacheLookup(sampleRate: number): boolean {
+  return sampleRate >= 1 || (sampleRate > 0 && Math.random() < sampleRate)
+}
+
+function logTenantPoolCacheLookup(
+  settings: TenantConnectionOptions,
+  outcome: CacheLookupOutcome
+): void {
+  const sampleRate =
+    outcome === 'hit' ? tenantPoolCacheHitLogSampleRate : tenantPoolCacheMissLogSampleRate
+
+  if (!shouldLogTenantPoolCacheLookup(sampleRate)) {
+    return
+  }
+
+  const log = {
+    type: TENANT_POOL_CACHE_LOOKUP_LOG_TYPE,
+    cache: TENANT_POOL_CACHE_NAME,
+    tenantId: settings.tenantId,
+    project: settings.tenantId,
+    outcome,
+    sampleRate,
+    sampleWeight: 1 / sampleRate,
+    isExternalPool: Boolean(settings.isExternalPool),
+  }
+
+  logSchema.info(logger, TENANT_POOL_CACHE_LOOKUP_LOG_MESSAGE, log)
+}
+
 const tenantPools = createTtlCache<string, PoolStrategy>({
   ...(isMultitenant ? multiTenantTtlConfig : { max: 1, ttl: Infinity }),
-  dispose: async (pool) => {
+  dispose: async (pool, _tenantId, reason) => {
     if (!pool || manuallyDestroyedPools.has(pool)) {
       return
     }
+
+    recordTenantPoolCacheEviction(reason)
 
     await destroyPoolSafely(pool)
   },
@@ -155,10 +206,10 @@ async function collectPoolStats() {
 }
 
 /**
- * PoolManager is a class that manages a pool of Knex connections.
- * It creates a new pool for each tenant and reuses existing pools.
+ * PoolManager manages tenant-specific database pools and the shared cache metrics.
+ * Concrete connection implementations provide the actual pool strategy.
  */
-export class PoolManager {
+export abstract class PoolManager<TPool extends PoolStrategy = PoolStrategy> {
   protected numWorkers: number = 1
 
   setNumWorkers(numWorkers: number) {
@@ -197,26 +248,24 @@ export class PoolManager {
     }
   }
 
-  rebalance(tenantId: string, data: { clusterSize: number }) {
+  rebalance(tenantId: string, data: PoolRebalanceOptions) {
     const pool = tenantPools.get(tenantId)
     if (pool) {
-      pool.rebalance({
-        clusterSize: data.clusterSize,
-      })
+      pool.rebalance({ ...data })
     }
   }
 
-  getPool(settings: TenantConnectionOptions) {
-    const existingPool = tenantPools.get(settings.tenantId)
+  getPool(settings: TenantConnectionOptions): TPool {
+    const { value: existingPool, outcome } = tenantPools.getWithOutcome(settings.tenantId)
+    recordTenantPoolCacheLookup(settings, outcome)
+
     if (existingPool) {
-      return existingPool
+      return existingPool as TPool
     }
 
     const newPool = this.newPool({ ...settings, numWorkers: this.numWorkers })
 
-    if ((settings.isSingleUse && !settings.isExternalPool) || !settings.isSingleUse) {
-      tenantPools.set(settings.tenantId, newPool)
-    }
+    tenantPools.set(settings.tenantId, newPool)
     return newPool
   }
 
@@ -247,135 +296,5 @@ export class PoolManager {
     return Promise.allSettled(promises)
   }
 
-  protected newPool(settings: TenantConnectionOptions) {
-    return new TenantPool(settings)
-  }
-}
-
-/**
- * TenantPool create a new Knex pool for each tenant, with rebalance
- * functionality to adjust the number of connections based on the cluster size.
- */
-class TenantPool implements PoolStrategy {
-  protected pool?: Knex
-
-  constructor(protected readonly options: TenantConnectionOptions) {}
-
-  acquire() {
-    if (this.pool) {
-      return this.pool
-    }
-
-    this.pool = this.createKnexPool()
-    return this.pool
-  }
-
-  destroy(): Promise<void> {
-    const originalPool = this.pool
-
-    if (!originalPool) {
-      return Promise.resolve()
-    }
-
-    this.pool = undefined
-    return this.drainPool(originalPool)
-  }
-
-  getPoolStats(): PoolStats | null {
-    const tarnPool = this.pool?.client?.pool
-    if (!tarnPool) return null
-    return {
-      used: tarnPool.numUsed(),
-      total: tarnPool.numUsed() + tarnPool.numFree(),
-    }
-  }
-
-  getSettings() {
-    const isSingleUseExternalPool = this.options.isSingleUse && this.options.isExternalPool
-
-    const numWorkers = Math.max(this.options.numWorkers ?? 1, 1)
-    const clusterSize = this.options.clusterSize || 0
-    let maxConnection = this.options.maxConnections || databaseMaxConnections
-
-    const divisor = Math.max(clusterSize, 1) * numWorkers
-    if (divisor > 1) {
-      maxConnection = Math.ceil(maxConnection / divisor) || 1
-    }
-
-    if (isSingleUseExternalPool) {
-      maxConnection = 1
-    }
-
-    return {
-      ...this.options,
-      searchPath: this.options.isExternalPool ? undefined : searchPath,
-      idleTimeoutMillis: isSingleUseExternalPool ? 100 : databaseFreePoolAfterInactivity,
-      reapIntervalMillis: isSingleUseExternalPool ? 50 : undefined,
-      maxConnections: maxConnection,
-    }
-  }
-
-  rebalance(options: { clusterSize: number }) {
-    if (options.clusterSize === 0) {
-      return
-    }
-
-    const originalPool = this.pool
-
-    this.options.clusterSize = options.clusterSize
-    this.pool = undefined
-
-    if (originalPool) {
-      this.drainPool(originalPool).catch((e) => {
-        logger.error({ type: 'pool', error: e })
-      })
-    }
-  }
-
-  protected async drainPool(pool: Knex) {
-    for (; pool?.client?.pool; ) {
-      let waiting = 0
-      waiting += pool.client.pool.numPendingAcquires()
-      waiting += pool.client.pool.numPendingValidations()
-      waiting += pool.client.pool.numPendingCreates()
-
-      if (waiting === 0) {
-        break
-      }
-
-      await wait(200)
-    }
-
-    return pool.destroy()
-  }
-
-  protected createKnexPool() {
-    const settings = this.getSettings()
-    const sslSettings = getSslSettings({
-      connectionString: settings.dbUrl,
-      databaseSSLRootCert,
-    })
-
-    const maxConnections = settings.maxConnections
-
-    return knex({
-      client: 'pg',
-      version: dbPostgresVersion,
-      searchPath: settings.searchPath,
-      pool: {
-        min: 0,
-        max: maxConnections,
-        acquireTimeoutMillis: databaseConnectionTimeout,
-        idleTimeoutMillis: settings.idleTimeoutMillis,
-        reapIntervalMillis: 1000,
-      },
-      connection: {
-        connectionString: settings.dbUrl,
-        connectionTimeoutMillis: databaseConnectionTimeout,
-        ssl: sslSettings ? { ...sslSettings } : undefined,
-        application_name: databaseApplicationName,
-      },
-      acquireConnectionTimeout: databaseConnectionTimeout,
-    })
-  }
+  protected abstract newPool(settings: TenantConnectionOptions): TPool
 }
