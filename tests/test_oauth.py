@@ -301,18 +301,10 @@ class TestO4_KongProtectedEndpoints:
 # ---------------------------------------------------------------------------
 
 class TestO5_AuthorizeRedirect:
-    # KNOWN ISSUE: /authorize?provider=google currently 500s with
-    # "Error creating flow state" because tenant DBs cloned from the
-    # supabase_template template carry the pre-fix auth.flow_state schema and
-    # are missing the OAuth-context columns (email_optional, oauth_client_state_id,
-    # ...). The template DB is initialized once and CREATE TABLE IF NOT EXISTS is a
-    # no-op on the cloned table, so the flow_state fix in 7c93cbc never reaches
-    # existing tenants or the template. Tracked separately; flip this to a hard
-    # assert once the template is refreshed and existing tenants are backfilled.
-    @pytest.mark.xfail(
-        reason="flow_state missing OAuth-context columns on template-cloned tenant DBs",
-        strict=False,
-    )
+    # The startup auth-schema self-heal (tenant-manager) now adds the flow_state
+    # OAuth-context columns AND relaxes the legacy PKCE NOT NULL constraints on
+    # every existing tenant DB, so the OAuth-redirect flow creates its flow_state
+    # row and /authorize redirects to Google. This is a hard assert.
     def test_o5_authorize_redirects_to_google_with_tenant_client_id(self):
         _ensure_anon_key()
         status, body, headers = _auth(
