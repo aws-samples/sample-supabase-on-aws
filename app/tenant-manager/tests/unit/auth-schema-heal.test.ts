@@ -57,15 +57,18 @@ describe('AUTH_SCHEMA_HEAL_STATEMENTS', () => {
 
     for (const stmt of AUTH_SCHEMA_HEAL_STATEMENTS) {
       const upper = stmt.toUpperCase()
-      // Never destructive.
-      expect(upper).not.toMatch(/\bDROP\b/)
+      // Never destructive: no dropping tables/columns/constraints, no data loss.
+      expect(upper).not.toMatch(/DROP\s+(TABLE|COLUMN|CONSTRAINT|DATABASE|SCHEMA|INDEX)/)
       expect(upper).not.toMatch(/\bDELETE\b/)
       expect(upper).not.toMatch(/\bTRUNCATE\b/)
-      expect(upper).not.toMatch(/ALTER\s+COLUMN/)
-      // Each is an additive ALTER (column add) or an idempotent DO-block.
+      // Each is one of: additive column add, an idempotent DO-block, or a
+      // constraint RELAXATION (ALTER COLUMN ... DROP NOT NULL) — the last is
+      // safe (loosens a constraint, touches no data) and needed to bring
+      // legacy template-cloned tenants in line with the current nullable schema.
       const isColumnAdd = /ADD COLUMN IF NOT EXISTS/i.test(stmt)
       const isGuardedDo = /^DO \$\$/i.test(stmt.trim()) && /DUPLICATE_OBJECT/i.test(upper)
-      expect(isColumnAdd || isGuardedDo).toBe(true)
+      const isDropNotNull = /ALTER COLUMN \w+ DROP NOT NULL/i.test(stmt)
+      expect(isColumnAdd || isGuardedDo || isDropNotNull).toBe(true)
     }
   })
 

@@ -708,6 +708,15 @@ export const AUTH_SCHEMA_HEAL_STATEMENTS: string[] = [
   `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS linking_target_id uuid NULL`,
   `ALTER TABLE auth.flow_state ADD COLUMN IF NOT EXISTS email_optional boolean NOT NULL DEFAULT FALSE`,
 
+  // Relax the legacy PKCE NOT NULL constraints. Tenant DBs cloned from an older
+  // template still have auth_code / code_challenge[_method] as NOT NULL, but the
+  // OAuth-redirect (provider login) flow inserts a flow_state row without them,
+  // so creation fails with 23502. The current CREATE TABLE already defines these
+  // as NULL; DROP NOT NULL aligns existing tenants (no-op if already nullable).
+  `ALTER TABLE auth.flow_state ALTER COLUMN auth_code DROP NOT NULL`,
+  `ALTER TABLE auth.flow_state ALTER COLUMN code_challenge DROP NOT NULL`,
+  `ALTER TABLE auth.flow_state ALTER COLUMN code_challenge_method DROP NOT NULL`,
+
   // oauth_clients OAuth 2.1 token endpoint auth method (column + CHECK).
   // ADD CONSTRAINT has no IF NOT EXISTS, so guard it with a catch of
   // duplicate_object to stay idempotent.
