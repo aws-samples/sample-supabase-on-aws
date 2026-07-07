@@ -452,8 +452,9 @@ curl -X PATCH "https://&lt;studio-alb&gt;/api/platform/auth/&lt;ref&gt;/users/&l
   <div class="note"><span class="label">supabase-js 等价:</span><code>signInWithOAuth({provider:'google'})</code>(5a)、<code>resetPasswordForEmail(email)</code>+<code>verifyOtp({type:'recovery',...})</code>(5b)。5c 在持有 service_role JWT 的服务端可用 <code>auth.admin.updateUserById(id,{password})</code>。</div>
   <div class="note"><span class="label">管理面 PUT provider 的 body:</span><code>enabled</code> 必填;当 <code>enabled=true</code> 时 <code>client_id</code> / <code>client_secret</code> / <code>redirect_uri</code> 三者必填;<code>skip_nonce_check</code> 可选(默认 false)。GET 读取时<b>不返回 client_secret</b>,仅返回 <code>secret_set: true/false</code>。</div>
   <p>需在 Google Cloud Console 把 <code>https://&lt;ref&gt;.&lt;domain&gt;/auth/v1/callback</code> 加入授权回调 URL。</p>
-  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh oauth</code> —— O0 取 anon key、O1 provider CRUD(加密+掩码)、O2 GoTrue <code>/settings</code> 反映租户 google、O3 Kong 放行 OAuth/SAML 端点、O4 受保护端点仍 key-auth、O5 <code>/authorize</code> 重定向到 Google 带租户 client_id。</p>
-  <div class="caution"><span class="label-c">已知问题(跟踪中):</span>从模板库 <code>supabase_template</code> 克隆出的租户库,其 <code>auth.flow_state</code> 表缺少本次新增的 OAuth 上下文列(<code>CREATE TABLE IF NOT EXISTS</code> 对已存在表是 no-op)。在<b>刷新模板库 + 回填现有租户</b>(<code>ALTER TABLE … ADD COLUMN IF NOT EXISTS</code>)之前,<code>/authorize?provider=google</code> 会返回 500(<code>Error creating flow state</code>)。oauth 套件的 O5 已据此标记为 <code>xfail</code>;修复后改为硬断言。</div>
+  <p><b>测试</b>:<code>PROJECT_REF=&lt;ref&gt; ./RUN_TESTS.sh oauth</code> —— O0 取 anon key、O1 provider CRUD(加密+掩码)、O2 GoTrue <code>/settings</code> 反映租户 google、O3 Kong 放行 OAuth/SAML 端点、O4 受保护端点仍 key-auth、O5 <code>/authorize</code> 重定向到 Google 带租户 client_id(硬断言)。</p>
+  <div class="ok"><span class="label">flow_state 缺列已由启动自愈解决:</span>tenant-manager 启动时的 auth-schema 自愈(<code>AUTH_SCHEMA_HEAL_STATEMENTS</code>,见第 11 节)会对模板库<b>及每个存量租户库</b>执行 <code>ALTER TABLE … ADD COLUMN IF NOT EXISTS</code>,补齐 <code>auth.flow_state</code> 的 OAuth 上下文列。因此升级后 <code>/authorize?provider=google</code> 正常返回 302(带本租户 client_id),O5 已作为<b>硬断言</b>通过——早期版本中该项曾因缺列返回 500 而临时标 <code>xfail</code>,现已修复。</div>
+  <div class="important"><span class="label">O2/O5 偶发失败=GoTrue 缓存传导延迟(非缺陷):</span>GoTrue 对租户 provider 配置有两层缓存(Manager TTL 5 分钟 + 连接池冻结),且无主动失效通路。通过管理面刚 <code>PUT</code> 完 provider <b>立即</b>跑 O2(<code>/settings</code>)/O5(<code>/authorize</code>) 可能读到旧值而失败;等缓存自然淘汰(空闲约 10 分钟 / LRU)后即恢复。若测试时遇到,<b>稍候重跑</b>或在配置与验证间留出传导窗口即可,功能本身正常。</div>
 
   <!-- ===== 11.6 function error classification ===== -->
   <h3>11.6 函数部署错误分类(404 → 422)</h3>
@@ -461,7 +462,7 @@ curl -X PATCH "https://&lt;studio-alb&gt;/api/platform/auth/&lt;ref&gt;/users/&l
   <p><b>使用</b>:正常部署/调用即可;错误响应体携带明确 error code,便于客户自查。</p>
   <p><b>测试</b>:<code>./RUN_TESTS.sh fn-errors</code> —— E1 坏代码部署即拒(422 FUNCTION_VALIDATION_FAILED)、E2 合法代码部署成功(201)、E3 缺失函数→404 FUNCTION_NOT_FOUND、E4 合法函数实际可运行,共 4 项。</p>
 
-  <div class="ok"><span class="label">一次性跑全部:</span><code>cd tests && pip install -r requirements.txt &amp;&amp; ./RUN_TESTS.sh all</code> 覆盖以上 6 项 + 既有功能回归。除 11.5 的 O5(xfail)与少量环境相关 skip 外,应全部 PASSED。</div>
+  <div class="ok"><span class="label">一次性跑全部:</span><code>cd tests && pip install -r requirements.txt &amp;&amp; ./RUN_TESTS.sh all</code> 覆盖以上 6 项 + 既有功能回归。除少量环境相关 skip 外,应全部 PASSED(oauth 的 O2/O5 若紧接配置后立即验证,可能因 GoTrue 缓存传导延迟偶发失败,稍候重跑即绿,见 11.5)。</div>
 
 </main>
 <footer>
