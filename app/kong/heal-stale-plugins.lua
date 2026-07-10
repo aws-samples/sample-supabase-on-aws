@@ -1,31 +1,26 @@
 -- heal-stale-plugins.lua
 --
--- Idempotently remove stale SERVICE-level auth plugins left on auth-service.
+-- Idempotently remove stale SERVICE-level auth plugins from auth-service and
+-- storage-service. Both moved their auth plugins (key-auth/acl/post-function)
+-- from SERVICE level down to ROUTE level so public endpoints (OAuth callbacks,
+-- storage signed/public URLs) hit directly by browsers are not gated by
+-- key-auth. Kong runs DB-backed and `kong config db_import` is an incremental
+-- upsert that never deletes removed entities, so on an upgraded environment the
+-- old service-level key-auth survives and keeps gating ALL routes -> 401.
 --
--- Why: Kong runs DB-backed and the entrypoint imports config with
--- `kong config db_import`, which is an incremental upsert that never deletes
--- entities removed from the declarative file. Commit 13cfc94 moved the auth
--- plugins (key-auth/acl/post-function) from the SERVICE level down to the
--- auth-route ROUTE level so the public OAuth callbacks (/auth/v1/callback,
--- /verify, /sso/saml/acs, /sso/saml/metadata) are not gated by key-auth.
--- On an environment that previously ran the old (service-level) config, the
--- stale service-level key-auth survives db_import and keeps gating ALL routes
--- under auth-service — including the public ones — yielding 401.
---
--- This script deletes any leftover SERVICE-level plugin in the auth allow-list
--- via the Admin API. It is:
+-- This deletes leftover SERVICE-level auth plugins via the Admin API. It is:
 --   * idempotent  — a clean install (service-level = only cors) deletes nothing
---   * narrow      — only auth-service, only the SERVICE level, only the listed
+--   * narrow      — only these services, only the SERVICE level, only the listed
 --                   auth plugins; never touches cors, route-level plugins, or
 --                   consumers/credentials (so tenant apikeys are never harmed)
 --   * fail-open   — any error logs and exits 0; it must never block Kong startup
 --
--- Run via: resty /heal-stale-plugins.lua   (resty ships in the kong image;
--- cjson + resty.http are both available — verified).
+-- Run via: resty /heal-stale-plugins.lua   (resty ships in the kong image).
 
 local ADMIN = os.getenv("KONG_ADMIN_INTERNAL_URL") or "http://localhost:8001"
-local SERVICE_NAME = "auth-service"
--- Plugins that, post-13cfc94, must only ever live at the ROUTE level.
+-- Services whose auth plugins were moved from SERVICE level to ROUTE level.
+local SERVICE_NAMES = { "auth-service", "storage-service" }
+-- Plugins that, post-migration, must only ever live at the ROUTE level.
 local STALE_AT_SERVICE_LEVEL = {
   ["key-auth"] = true,
   ["acl"] = true,
@@ -59,35 +54,51 @@ local function admin_request(method, path)
   return res
 end
 
--- Resolve and clean the auth-service's service-level plugins.
-local res, err = admin_request("GET", "/services/" .. SERVICE_NAME .. "/plugins")
-if not res then bail("cannot reach Admin API: " .. tostring(err)) end
-if res.status ~= 200 then
-  -- 404 = auth-service not present yet (nothing to heal); treat as clean.
-  bail("GET plugins returned HTTP " .. res.status)
-end
+-- Clean one service's stale service-level plugins. Per-service failures are
+-- non-fatal: log and skip (return) so the remaining services are still
+-- processed. Only a missing resty.http/cjson dependency bails the whole run.
+local function heal_service(service_name)
+  local res, err = admin_request("GET", "/services/" .. service_name .. "/plugins")
+  if not res then
+    log("skipped " .. service_name .. " (non-fatal): cannot reach Admin API: " .. tostring(err))
+    return
+  end
+  if res.status ~= 200 then
+    -- 404 = service not present yet (nothing to heal); treat as clean.
+    log("skipped " .. service_name .. " (non-fatal): GET plugins returned HTTP " .. res.status)
+    return
+  end
 
-local body = cjson.decode(res.body)
-if not body or type(body.data) ~= "table" then bail("unexpected plugins payload") end
+  local body = cjson.decode(res.body)
+  if not body or type(body.data) ~= "table" then
+    log("skipped " .. service_name .. " (non-fatal): unexpected plugins payload")
+    return
+  end
 
-local removed = 0
-for _, plugin in ipairs(body.data) do
-  if STALE_AT_SERVICE_LEVEL[plugin.name] and plugin.id then
-    local del, derr = admin_request("DELETE", "/plugins/" .. plugin.id)
-    if del and (del.status == 204 or del.status == 200) then
-      removed = removed + 1
-      log("Removed stale service-level plugin: " .. plugin.name .. " (" .. plugin.id .. ")")
-    else
-      -- Non-fatal: log and keep going; a leftover is better than a dead gateway.
-      log("WARN failed to delete " .. plugin.name .. " -> " ..
-        (del and ("HTTP " .. del.status) or tostring(derr)))
+  local removed = 0
+  for _, plugin in ipairs(body.data) do
+    if STALE_AT_SERVICE_LEVEL[plugin.name] and plugin.id then
+      local del, derr = admin_request("DELETE", "/plugins/" .. plugin.id)
+      if del and (del.status == 204 or del.status == 200) then
+        removed = removed + 1
+        log("Removed stale service-level plugin from " .. service_name .. ": " ..
+          plugin.name .. " (" .. plugin.id .. ")")
+      else
+        -- Non-fatal: log and keep going; a leftover is better than a dead gateway.
+        log("WARN failed to delete " .. plugin.name .. " on " .. service_name .. " -> " ..
+          (del and ("HTTP " .. del.status) or tostring(derr)))
+      end
     end
+  end
+
+  if removed == 0 then
+    log("no stale service-level auth plugins on " .. service_name .. " (nothing to do)")
+  else
+    log("done; removed " .. removed .. " stale service-level plugin(s) from " .. service_name)
   end
 end
 
-if removed == 0 then
-  log("no stale service-level auth plugins on " .. SERVICE_NAME .. " (nothing to do)")
-else
-  log("done; removed " .. removed .. " stale service-level plugin(s) from " .. SERVICE_NAME)
+for _, service_name in ipairs(SERVICE_NAMES) do
+  heal_service(service_name)
 end
 os.exit(0)
