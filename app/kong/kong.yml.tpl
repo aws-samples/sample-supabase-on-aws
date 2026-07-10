@@ -299,13 +299,27 @@ services:
           - HEAD
           - PUT
           - OPTIONS
-        strip_path: true
+        # strip_path is false: the matched paths above differ in length
+        # (/object/sign vs /object/public/...), so Kong's automatic strip would
+        # remove the whole matched prefix (e.g. /storage/v1/object/sign),
+        # leaving storage-api with a bogus /files/... path -> 404. Instead we
+        # strip the fixed-length /storage/v1 prefix manually below, mirroring
+        # storage-route's effective behavior.
+        strip_path: false
         plugins:
           # Subdomain -> X-Project-ID only; no key-auth / post-function / acl.
           - name: pre-function
             config:
               access:
                 - |
+                  -- Strip the fixed-length "/storage/v1" (11 chars) prefix so
+                  -- storage-api sees /object/sign/... etc. sub(12) avoids the
+                  -- pattern engine and matches storage-route's stripped path.
+                  local path = kong.request.get_path()
+                  local stripped = path:sub(12)
+                  if stripped == "" then stripped = "/" end
+                  kong.service.request.set_path(stripped)
+
                   local host = kong.request.get_header("Host")
                   if host then
                     host = host:gsub(":%d+$", "")
