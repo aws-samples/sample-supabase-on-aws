@@ -15,3 +15,66 @@ ignore:
   - vulnerability: GHSA-9h8m-3fm2-qjrq
     package:
       name: go.opentelemetry.io/otel/sdk
+
+  # Build-time only toolchain (glob matching, bundling, asset optimisation).
+  # These run during `npm ci` / `next build` and are stripped from runtime
+  # images by `npm prune --omit=dev`, so the ReDoS/traversal paths are not
+  # reachable at runtime. Awaiting upstream lockfile refresh.
+  - vulnerability: GHSA-3ppc-4f35-3m26
+    package:
+      name: minimatch
+  - vulnerability: GHSA-23c5-xmqv-rm74
+    package:
+      name: minimatch
+  - vulnerability: GHSA-7r86-cg39-jmmj
+    package:
+      name: minimatch
+  - vulnerability: GHSA-mw96-cpmx-2vgc
+    package:
+      name: rollup
+  - vulnerability: GHSA-5c6j-r48x-rmvq
+    package:
+      name: serialize-javascript
+  - vulnerability: GHSA-xpqw-6gx7-v673
+    package:
+      name: svgo
+  - vulnerability: GHSA-35jh-r3h4-6jhm
+    package:
+      name: lodash.template
+  - vulnerability: GHSA-wf6x-7x77-mvgw
+    package:
+      name: immutable
+  - vulnerability: GHSA-qffp-2rhf-9h96
+    package:
+      name: tar
+
+  # Upstream Studio fork (app/function-deploy) dependency tree — not our code
+  # to fix, and not reachable from our data plane:
+  #   - fastify 4.29.1 comes from the Studio pnpm lockfile, not from the
+  #     storage / postgres-meta / tenant-manager services.
+  #   - next-mdx-remote renders repository-bundled docs (alongside the
+  #     mdast/micromark toolchain), never untrusted user-supplied MDX.
+  #   - hono / @hono/node-server are transitive only; no source file imports
+  #     them, so serveStatic and the ALB conninfo path are never executed.
+  - vulnerability: GHSA-jx2c-rxcm-jvmq
+    package:
+      name: fastify
+  - vulnerability: GHSA-g4xw-jxrg-5f6m
+    package:
+      name: next-mdx-remote
+  - vulnerability: GHSA-q5qw-h33p-qvwr
+    package:
+      name: hono
+  - vulnerability: GHSA-xh87-mx6m-69f3
+    package:
+      name: hono
+  - vulnerability: GHSA-wc8c-qw6v-h7f6
+    package:
+      name: "@hono/node-server"
+
+  # Rate limiting is disabled on the storage service
+  # (RATE_LIMITER_ENABLED=false), so the IPv4-mapped IPv6 bypass has no
+  # effect. Revisit if rate limiting is switched on.
+  - vulnerability: GHSA-46wh-pxpv-q5gq
+    package:
+      name: express-rate-limit
