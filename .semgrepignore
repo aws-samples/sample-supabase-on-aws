@@ -6,12 +6,18 @@ app/postgres-meta/
 app/function-deploy/apps/studio/
 app/function-deploy/packages/
 app/function-deploy/docker/
+app/storage/
 app/studio/
 
 # Test scripts with intentional hardcoded test JWTs
 app/postgrest-lambda/test_*
 app/postgrest-lambda/generate_jwt.py
 tests/
+
+# AWS CLI wrapper builds argv as a list and never uses shell=True, so shell
+# metacharacters cannot be interpreted — dangerous-subprocess-use-audit is a
+# manual-review hint here, not an injection path.
+scripts/aurora_pg_serverless_setup.py
 
 # Node modules
 node_modules/
