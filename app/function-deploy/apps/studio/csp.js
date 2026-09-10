@@ -158,7 +158,6 @@ module.exports.getCSP = function getCSP() {
 
   const scriptSrcDirective = [
     `script-src 'self'`,
-    `'unsafe-eval'`,
     `'unsafe-inline'`,
     ...SCRIPT_SRC_URLS,
     VERCEL_LIVE_URL,
