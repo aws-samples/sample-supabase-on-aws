@@ -130,6 +130,9 @@ curl -o certs/global-bundle.pem https://truststore.pki.rds.amazonaws.com/global/
 cd infra && npm run build && npx cdk deploy SupabaseStack --require-approval never
 ```
 
+> [!WARNING]
+> The Studio ALB is internet-facing by default for testing only, and Studio has no login step. Read [Security](#security) and make the Studio ALB internal before production use.
+
 Then set ECR Lambda pull permissions:
 
 ```bash
@@ -330,6 +333,17 @@ cd tests && ./RUN_TESTS.sh all         # All suites
 | Go build timeout | auth-service Docker build hangs | Add `ENV GOPROXY=https://goproxy.cn,direct` to Dockerfile |
 
 ## Security
+
+> [!WARNING]
+> **The Studio ALB is internet-facing for testing convenience only. Make it internal before any production use.**
+>
+> By default the Studio ALB (`StudioALB` in `infra/lib/supabase-stack.ts`) is deployed with `internetFacing: true`, and its security group allows `0.0.0.0/0` on ports 80/443, so you can reach Studio quickly while evaluating this sample. Studio and the function-deploy API behind it have **no login step**: Studio runs in self-hosted mode, and function-deploy runs with `STUDIO_NO_AUTH_MODE=true`. Anyone who can reach the Studio ALB can manage projects, run SQL, read and change project secrets, and deploy Edge Functions.
+>
+> For production:
+>
+> 1. Set `internetFacing: false` on `StudioALB` in `infra/lib/supabase-stack.ts`.
+> 2. Restrict the Studio ALB security group to your VPC, VPN, or corporate CIDR: replace the `ec2.Peer.anyIpv4()` ingress rules on `studioAlbSG`, and set `open: false` on both `StudioHttpsListener` and `StudioHttpListener` (CDK's default `open: true` adds its own `0.0.0.0/0` ingress rule).
+> 3. Access Studio only over private connectivity (AWS Client VPN, Site-to-Site VPN, Direct Connect, or SSM port forwarding).
 
 All database connections use SSL with certificate verification (`verify-ca` mode) against the AWS RDS global CA bundle.
 
