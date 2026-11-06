@@ -55,18 +55,6 @@ export async function getCurrentUserId(
       return null
     }
 
-    // Check if this is a SERVICE_ROLE_KEY (role: service_role)
-    if (isServiceRoleKey(token)) {
-      console.log('SERVICE_ROLE_KEY detected, returning service_role identifier')
-      return 'service_role'
-    }
-    
-    // Check if this is an ANON_KEY (role: anon)
-    if (isAnonKey(token)) {
-      console.log('ANON_KEY detected, returning anon identifier')
-      return 'anon'
-    }
-    
     // If no projectRef provided, try to extract it from the request
     const resolvedProjectRef = projectRef || extractProjectRefFromRequest(req)
     
@@ -83,9 +71,14 @@ export async function getCurrentUserId(
       return null
     }
     
-    // Check if this is an anon role without sub (ANON_KEY)
-    if (decoded.role === 'anon' && !decoded.sub) {
-      console.log('ANON_KEY detected (role: anon, no sub), returning anon identifier')
+    // Role claims are trusted only after the signature has been verified above
+    if (decoded.role === 'service_role') {
+      console.log('SERVICE_ROLE_KEY detected, returning service_role identifier')
+      return 'service_role'
+    }
+
+    if (decoded.role === 'anon') {
+      console.log('ANON_KEY detected, returning anon identifier')
       return 'anon'
     }
     
@@ -189,38 +182,6 @@ function extractTokenFromRequest(req: NextApiRequest): string | null {
 }
 
 /**
- * Check if a token is a SERVICE_ROLE_KEY by decoding and checking the role claim
- * 
- * @param token - JWT token string
- * @returns true if token has role: service_role
- */
-function isServiceRoleKey(token: string): boolean {
-  try {
-    // Decode without verification to check the role claim
-    const decoded = jwt.decode(token) as any
-    return decoded && decoded.role === 'service_role'
-  } catch (error) {
-    return false
-  }
-}
-
-/**
- * Check if a JWT token is an ANON_KEY
- * 
- * @param token - JWT token string
- * @returns true if token has role: anon
- */
-function isAnonKey(token: string): boolean {
-  try {
-    // Decode without verification to check the role claim
-    const decoded = jwt.decode(token) as any
-    return decoded && decoded.role === 'anon'
-  } catch (error) {
-    return false
-  }
-}
-
-/**
  * Verify JWT token signature and expiration
  * Supports both global and project-specific JWT secrets
  * 
@@ -274,10 +235,10 @@ async function verifyJwtToken(
         }
         
         const decoded = jwt.verify(token, globalJwtSecret, verifyOptions)
-        
-        if (typeof decoded === 'object' && decoded !== null && 'sub' in decoded) {
-          // Token is valid with required user identity claims
-          // Note: We no longer check for project_ref claim as GoTrue JWT doesn't include it
+
+        if (typeof decoded === 'object' && decoded !== null) {
+          // Signature verified. Callers decide based on role/sub claims:
+          // API keys (anon/service_role) carry no `sub`, user tokens do.
           // Project access is verified separately via database queries
           return decoded
         }
@@ -344,10 +305,8 @@ async function verifyJwtToken(
             algorithms: ['HS256'],
           })
           
-          if (typeof decoded === 'object' && decoded !== null && 'sub' in decoded) {
+          if (typeof decoded === 'object' && decoded !== null) {
             console.log('Successfully verified JWT with project-specific secret for project:', projectRef)
-            // Token is valid with required user identity claims
-            // Note: We no longer check for project_ref claim
             return decoded
           }
         } catch (projectError: any) {
